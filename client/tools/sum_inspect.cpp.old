@@ -1,0 +1,223 @@
+/**
+ * @file sum_inspect.cpp
+ * @brief Tool for inspecting certificate metadata
+ *
+ * Copyright 2025 libsum contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "sum/common/crypto.h"
+#include "sum/common/manifest.h"
+#include <glog/logging.h>
+#include <nlohmann/json.hpp>
+#include <iostream>
+#include <iomanip>
+
+void PrintUsage(const char* program_name) {
+    std::cerr << "Usage: " << program_name << " [OPTIONS]\n"
+              << "\n"
+              << "Inspect certificate metadata and manifest\n"
+              << "\n"
+              << "Required:\n"
+              << "  --certificate FILE     Certificate to inspect (.crt or .pem)\n"
+              << "\n"
+              << "Optional:\n"
+              << "  --format FORMAT        Output format: text (default) or json\n"
+              << "  --verify-with FILE     Verify certificate with CA cert\n"
+              << "  --help                 Show this help\n"
+              << "\n"
+              << "Examples:\n"
+              << "  # Inspect certificate metadata\n"
+              << "  sum-inspect --certificate update.crt\n"
+              << "\n"
+              << "  # Inspect with JSON output\n"
+              << "  sum-inspect --certificate update.crt --format json\n"
+              << "\n"
+              << "  # Inspect and verify signature\n"
+              << "  sum-inspect --certificate update.crt --verify-with ca.crt\n";
+}
+
+std::string FormatTimestamp(int64_t timestamp) {
+    if (timestamp <= 0) return "Not set";
+
+    time_t t = timestamp;
+    char buf[100];
+    struct tm* tm_info = gmtime(&t);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", tm_info);
+    return std::string(buf);
+}
+
+void PrintTextFormat(const sum::crypto::Certificate& cert) {
+    std::cout << "═══════════════════════════════════════════════════════════\n";
+    std::cout << "Certificate Information\n";
+    std::cout << "═══════════════════════════════════════════════════════════\n\n";
+
+    // Basic certificate info
+    std::cout << "Subject: " << cert.GetSubject() << "\n";
+    std::cout << "Issuer:  " << cert.GetIssuer() << "\n";
+
+    auto validity = cert.GetValidityPeriod();
+    std::cout << "Valid From: " << FormatTimestamp(validity.first) << "\n";
+    std::cout << "Valid To:   " << FormatTimestamp(validity.second) << "\n";
+
+    std::cout << "\n";
+
+    // Device metadata
+    if (cert.HasDeviceMetadata()) {
+        auto metadata_raw = cert.ExtractDeviceMetadata();
+        std::string metadata_str(metadata_raw.begin(), metadata_raw.end());
+        auto metadata = nlohmann::json::parse(metadata_str);
+
+        std::cout << "Device Metadata:\n";
+        std::cout << "───────────────────────────────────────────────────────────\n";
+
+        if (metadata.contains("hardware_id")) {
+            std::cout << "  Hardware ID:      " << metadata["hardware_id"] << "\n";
+        }
+        if (metadata.contains("manufacturer")) {
+            std::cout << "  Manufacturer:     " << metadata["manufacturer"] << "\n";
+        }
+        if (metadata.contains("device_type")) {
+            std::cout << "  Device Type:      " << metadata["device_type"] << "\n";
+        }
+        if (metadata.contains("hardware_version")) {
+            std::cout << "  Hardware Version: " << metadata["hardware_version"] << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    // Manifest
+    if (cert.HasManifest()) {
+        auto manifest_protobuf = cert.ExtractManifest();
+        auto manifest = sum::Manifest::LoadFromProtobuf(manifest_protobuf);
+        std::string manifest_json_str = manifest.ToDebugJSON();
+        auto manifest_json = nlohmann::json::parse(manifest_json_str);
+
+        std::cout << "Manifest:\n";
+        std::cout << "───────────────────────────────────────────────────────────\n";
+        std::cout << "  Version: " << manifest_json.value("manifestVersion", "0") << "\n";
+
+        if (manifest_json.contains("artifacts")) {
+            auto artifacts = manifest_json["artifacts"];
+            std::cout << "  Artifacts: " << artifacts.size() << "\n";
+
+            for (size_t i = 0; i < artifacts.size(); i++) {
+                const auto& art = artifacts[i];
+                std::cout << "\n  Artifact " << i << ":\n";
+                if (art.contains("name")) {
+                    std::cout << "    Name: " << art["name"] << "\n";
+                }
+                if (art.contains("type")) {
+                    std::cout << "    Type: " << art["type"] << "\n";
+                }
+                if (art.contains("size")) {
+                    std::cout << "    Size: " << art["size"] << " bytes\n";
+                }
+            }
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "═══════════════════════════════════════════════════════════\n";
+}
+
+void PrintJsonFormat(const sum::crypto::Certificate& cert) {
+    nlohmann::json output;
+
+    output["subject"] = cert.GetSubject();
+    output["issuer"] = cert.GetIssuer();
+
+    auto validity = cert.GetValidityPeriod();
+    output["valid_from"] = validity.first;
+    output["valid_to"] = validity.second;
+
+    if (cert.HasDeviceMetadata()) {
+        auto metadata_raw = cert.ExtractDeviceMetadata();
+        std::string metadata_str(metadata_raw.begin(), metadata_raw.end());
+        output["device_metadata"] = nlohmann::json::parse(metadata_str);
+    }
+
+    if (cert.HasManifest()) {
+        auto manifest_protobuf = cert.ExtractManifest();
+        auto manifest = sum::Manifest::LoadFromProtobuf(manifest_protobuf);
+        std::string manifest_json_str = manifest.ToDebugJSON();
+        output["manifest"] = nlohmann::json::parse(manifest_json_str);
+    }
+
+    std::cout << output.dump(2) << "\n";
+}
+
+int main(int argc, char** argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
+    FLAGS_minloglevel = 2;
+
+    std::string cert_path;
+    std::string format = "text";
+    std::string verify_with;
+
+    // Parse arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--help" || arg == "-h") {
+            PrintUsage(argv[0]);
+            return 0;
+        } else if (arg == "--certificate" && i + 1 < argc) {
+            cert_path = argv[++i];
+        } else if (arg == "--format" && i + 1 < argc) {
+            format = argv[++i];
+        } else if (arg == "--verify-with" && i + 1 < argc) {
+            verify_with = argv[++i];
+        } else {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            PrintUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (cert_path.empty()) {
+        std::cerr << "Error: --certificate is required\n\n";
+        PrintUsage(argv[0]);
+        return 1;
+    }
+
+    if (format != "text" && format != "json") {
+        std::cerr << "Error: --format must be 'text' or 'json'\n";
+        return 1;
+    }
+
+    try {
+        auto cert = sum::crypto::Certificate::LoadFromFile(cert_path);
+
+        // Optional verification
+        if (!verify_with.empty()) {
+            auto ca_cert = sum::crypto::Certificate::LoadFromFile(verify_with);
+
+            // Extract CA public key and verify signature
+            auto ca_pubkey = ca_cert.GetPublicKey();
+
+            if (cert.VerifySignature(ca_pubkey)) {
+                if (format == "text") {
+                    std::cout << "✓ Certificate signature verified with CA\n\n";
+                }
+            } else {
+                std::cerr << "Error: Certificate signature verification failed\n";
+                return 1;
+            }
+        }
+
+        // Print certificate info
+        if (format == "json") {
+            PrintJsonFormat(cert);
+        } else {
+            PrintTextFormat(cert);
+        }
+
+        return 0;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}

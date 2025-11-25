@@ -1,0 +1,237 @@
+/**
+ * @file manifest.proto
+ * @brief Secure Update Manifest Protocol Buffer Schema
+ *
+ * Uptane-inspired security model for embedded systems:
+ * - Delegation via certificate chains (Root → Intermediate → Update cert)
+ * - Rollback protection via release_counter
+ * - Snapshot protection via manifest_hash
+ * - Flexible artifact routing via type and target_ecu
+ * - Deterministic installation order
+ * - Content-addressable storage support
+ * - Mandatory per-device encryption
+ *
+ * Copyright 2025 libsum contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package sum.proto;
+
+/**
+ * Secure Update Manifest
+ *
+ * This message is embedded in X.509 certificate extension (OID 1.3.6.1.3.2).
+ * The certificate provides cryptographic chain-of-trust via PKI.
+ */
+/**
+ * Semantic version (major.minor.patch)
+ *
+ * Used for compatibility checking:
+ * - Major: Incompatible API changes
+ * - Minor: Backward-compatible functionality additions
+ * - Patch: Backward-compatible bug fixes
+ */
+message SemVer {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+  string prerelease = 4;  // Optional: "alpha", "beta.1", "rc.2"
+  string build_metadata = 5;  // Optional: "20250124", "git.abc123"
+}
+
+message Manifest {
+  // Schema version (currently 1)
+  uint32 version = 1;
+
+  // Software version (user-controlled, can skip versions)
+  // Use for display purposes. Use release_counter for rollback protection.
+  // DEPRECATED: Use software_version instead for semantic versioning
+  uint64 manifest_version = 2;
+
+  // Monotonic counter (MUST increment, CANNOT skip)
+  // Primary rollback protection mechanism (Uptane-inspired)
+  uint64 release_counter = 3;
+
+  // Semantic version of the software being installed
+  // Provides better compatibility tracking than simple manifest_version
+  SemVer software_version = 5;
+
+  // SHA-256 hash of canonical manifest serialization (excluding signature field)
+  // Prevents mix-and-match attacks (Uptane Snapshot role)
+  bytes manifest_hash = 4;
+
+  // Software artifacts to install
+  repeated Artifact artifacts = 10;
+
+  // Encryption parameters (AES-GCM + X25519 key wrapping)
+  // SECURITY: One entry per (artifact, device) pair - mandatory per-device encryption
+  repeated EncryptionParams encryption = 11;
+
+  // Ed25519 signature over canonical manifest (excluding this field)
+  // Signed by the private key corresponding to the certificate's public key
+  bytes signature = 20;
+
+  // DER-encoded signing certificate (typically intermediate CA)
+  // Used for signature verification on artifacts
+  bytes signing_cert = 21;
+
+  // Optional user metadata (e.g., vendor, release notes, etc.)
+  map<string, string> metadata = 30;
+}
+
+/**
+ * Download source with priority-based fallback
+ */
+message Source {
+  // URI to fetch artifact
+  // Supported schemes: http://, https://, s3://, ipfs://, file://, ca://
+  string uri = 1;
+
+  // Priority (0 = highest, try first; 1 = fallback; etc.)
+  uint32 priority = 2;
+
+  // Optional hint about source type for client optimization
+  // Examples: "http", "s3", "ipfs", "file", "ca"
+  string type = 3;
+}
+
+/**
+ * Software artifact (firmware, filesystem, container, etc.)
+ *
+ * Uptane-inspired fields:
+ * - type: Identifies artifact purpose (similar to Uptane custom metadata)
+ * - target_ecu: Routes to specific component (Uptane ecuIdentifier)
+ * - install_order: Deterministic installation sequence
+ */
+message Artifact {
+  // Unique identifier within this manifest
+  // Examples: "application", "bootloader", "filesystem"
+  string name = 1;
+
+  // Artifact type (determines handling on device)
+  // Standard types: "firmware", "bootloader", "filesystem", "container", "package", "map", "model", "data"
+  // Custom types allowed (e.g., "my-company-config")
+  string type = 2;
+
+  // Target component/ECU identifier
+  // Examples: "primary", "wifi-coprocessor", "camera", "lidar"
+  // Device routes artifact to appropriate component based on this field
+  string target_ecu = 3;
+
+  // Installation order (0 = first, 1 = second, etc.)
+  // Device MUST process artifacts in ascending order
+  // Use case: Install bootloader (order=0) before firmware (order=1)
+  uint32 install_order = 4;
+
+  // === Plaintext verification (after decryption) ===
+
+  // Hash algorithm for plaintext (currently only "SHA-256" supported)
+  string hash_algorithm = 10;
+
+  // Expected hash of decrypted artifact (32 bytes for SHA-256)
+  // This is what gets signed by signature field
+  bytes expected_hash = 11;
+
+  // Size of plaintext in bytes (for storage planning)
+  uint64 size = 12;
+
+  // === Ciphertext verification (for download) ===
+
+  // SHA-256 hash of encrypted file (*.enc)
+  // Used for:
+  // 1. Content-addressable storage (ipfs://<ciphertext_hash>)
+  // 2. Verify download integrity before decryption
+  // 3. Detect corrupted/wrong downloads early
+  bytes ciphertext_hash = 13;
+
+  // Size of encrypted file in bytes (for download progress)
+  uint64 ciphertext_size = 14;
+
+  // === Signature ===
+
+  // Signature algorithm (currently only "Ed25519" supported)
+  string signature_algorithm = 20;
+
+  // Ed25519 signature over expected_hash (64 bytes)
+  // Signed by signing_cert's private key
+  bytes signature = 21;
+
+  // === Source discovery ===
+
+  // Download sources (try in priority order)
+  // If empty and content_addressable=true, device can auto-discover
+  repeated Source sources = 40;
+
+  // If true, artifact can be located by ciphertext_hash
+  // Device may construct URIs like: ipfs://<ciphertext_hash>
+  bool content_addressable = 41;
+}
+
+/**
+ * Encryption parameters for artifact
+ *
+ * Uses AES-128-GCM AEAD for authenticated encryption
+ * Uses X25519 ECDH + HKDF + ChaCha20-Poly1305 for key wrapping
+ *
+ * SECURITY: device_id is MANDATORY for per-device encryption
+ * Each device can only decrypt artifacts encrypted specifically for it
+ */
+message EncryptionParams {
+  // Which artifact this applies to (matches Artifact.name)
+  string artifact_name = 1;
+
+  // MANDATORY: Target device identifier
+  // Backend MUST lookup device's public key and wrap key specifically for that device
+  // Device MUST verify this matches its own ID before attempting unwrap
+  // SECURITY: Prevents compromise of one device from affecting others
+  string device_id = 2;
+
+  // === AES-GCM parameters ===
+
+  // Encryption algorithm (currently only "AES-128-GCM" supported)
+  string algorithm = 10;
+
+  // GCM nonce/IV (12 bytes)
+  // Stored in manifest, NOT in encrypted file
+  bytes iv = 11;
+
+  // GCM authentication tag (16 bytes)
+  // Stored in manifest, NOT in encrypted file
+  // Verified during decryption finalization
+  bytes tag = 12;
+
+  // === Key wrapping (X25519) ===
+
+  // Key wrapping algorithm (currently only "X25519-HKDF-SHA256-ChaCha20Poly1305" supported)
+  string key_wrapping_algorithm = 20;
+
+  // Wrapped AES-128 key (76 bytes)
+  // Format: ephemeral_pubkey(32) || nonce(12) || ciphertext(16) || auth_tag(16)
+  // Device unwraps using its X25519 private key
+  bytes wrapped_key = 21;
+}
+
+/**
+ * Device metadata (embedded in X.509 certificate extension OID 1.3.6.1.3.1)
+ *
+ * Identifies the device/certificate purpose and hardware requirements.
+ * Used for certificate validation and update routing.
+ */
+message DeviceMetadata {
+  // Device type/role
+  // Examples: "Root-CA", "Intermediate-CA", "ESP32-OTA-Example", "Production-Device"
+  string device_type = 1;
+
+  // Unique hardware identifier
+  // Examples: "LIBSUM-TINY-ROOT-CA", "ESP32-TEST-DEVICE-001", device serial number
+  string hardware_id = 2;
+
+  // Manufacturer/vendor name
+  string manufacturer = 3;
+
+  // Optional hardware version
+  // Examples: "v1.0", "rev-B", "2024"
+  string hardware_version = 4;
+}
