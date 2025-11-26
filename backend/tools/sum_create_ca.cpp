@@ -145,15 +145,15 @@ int main(int argc, char** argv) {
             std::cout << "Created self-signed root CA certificate:\n";
         }
 
-        // Write output
-        std::ofstream out(output_path, std::ios::binary);
+        // Write output in PEM format (required for LoadFromFile to work)
+        std::ofstream out(output_path);
         if (!out) {
             std::cerr << "Error: Cannot write to " << output_path << "\n";
             return 1;
         }
 
-        auto der = ca_cert.ToDER();
-        out.write(reinterpret_cast<const char*>(der.data()), der.size());
+        auto pem = ca_cert.ToPEM();
+        out.write(pem.data(), pem.size());
 
         std::cout << "  Hardware ID: " << hardware_id << "\n"
                   << "  Common Name: " << common_name << "\n"

@@ -27,16 +27,58 @@ Protocol Buffers format:
 
 ```protobuf
 message DeviceMetadata {
-  string device_type = 1;         // "ESP32-Gateway", "Root-CA", etc.
-  string hardware_id = 2;         // "DEVICE-12345"
-  string manufacturer = 3;        // "Acme Corp"
-  string hardware_version = 4;    // "v2.1" (optional)
+  string device_type = 1;              // "ESP32-Gateway", "Root-CA", etc.
+  string hardware_id = 2;              // "DEVICE-12345"
+  string manufacturer = 3;             // "Acme Corp"
+  string hardware_version = 4;         // "v2.1" (optional)
+
+  // Operational metadata for workshop/filtering
+  uint64 manifest_version = 5;         // For ordering updates
+  ManifestType manifest_type = 6;      // FULL or DELTA
+  repeated ArtifactInfo provides = 7;  // What this update installs
+  repeated ArtifactConstraint requires = 8;  // Device state requirements
+}
+
+message ArtifactInfo {
+  string name = 1;                // "firmware"
+  string type = 2;                // "firmware"
+  string target_ecu = 3;          // "primary"
+  uint64 security_version = 4;    // 15 (what this update provides)
+  SemVer version = 5;             // "2.0.0" (optional)
+}
+
+message ArtifactConstraint {
+  string name = 1;                // "firmware"
+  string type = 2;                // "firmware"
+  string target_ecu = 3;          // "primary"
+  uint64 min_security_version = 4;  // Minimum required (inclusive)
+  uint64 max_security_version = 5;  // Maximum compatible (inclusive, 0 = no limit)
+                                     // Used for sequential migrations (e.g., Android 8→9→10, can't skip)
 }
 ```
 
-**Purpose**: Quick filtering before expensive cryptographic operations.
+**Purpose**: Quick filtering and workshop upgrade path determination.
 
-**Security**: Readable without signature verification. Use only for filtering, not security decisions. Call `GetDeviceMetadata()` for unverified read or `GetVerifiedDeviceMetadata()` for verified access.
+**Security**: UNVERIFIED data, readable without signature verification. Use only for filtering and operational decisions. Device MUST use verified manifest data for security decisions.
+
+**Workshop Use Case**:
+```
+Device at: firmware@primary security_version=10
+
+Update A metadata:
+  manifest_version: 5
+  provides: firmware@primary security_version=15
+  requires: firmware@primary min=5, max=12
+
+Update B metadata:
+  manifest_version: 6
+  provides: firmware@primary security_version=20
+  requires: firmware@primary min=15
+
+Workshop decision:
+  - Device (v10) matches Update A requirements (10 in [5,12]) → Apply A
+  - After A, device (v15) matches Update B requirements (15 >= 15) → Apply B
+```
 
 ### Extension 1.3.6.1.3.2: Update Manifest
 

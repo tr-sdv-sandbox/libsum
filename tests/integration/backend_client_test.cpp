@@ -9,12 +9,13 @@
 #include <gtest/gtest.h>
 #include "sum/common/crypto.h"
 #include "sum/common/manifest.h"
-#include "sum/backend/generator.h"
+#include "sum/backend/manifest_builder.h"
 #include "sum/client/validator.h"
 #include "manifest.pb.h"
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <ctime>
+#include <fstream>
 
 using namespace sum;
 using namespace sum::crypto;
@@ -389,57 +390,95 @@ TEST(IntegrationTest, RejectTamperedWrappedKey) {
 // ============================================================================
 
 TEST(IntegrationTest, ManifestEmbeddedInCertificate) {
+    // Create proper 3-tier PKI: Root CA → Intermediate CA → Update Cert
+
     // Generate keys
-    auto backend_privkey = PrivateKey::Generate(KeyType::Ed25519);
-    auto backend_pubkey = PublicKey::FromPrivateKey(backend_privkey);
+    auto root_privkey = PrivateKey::Generate(KeyType::Ed25519);
+    auto root_pubkey = PublicKey::FromPrivateKey(root_privkey);
+    auto intermediate_privkey = PrivateKey::Generate(KeyType::Ed25519);
+    auto intermediate_pubkey = PublicKey::FromPrivateKey(intermediate_privkey);
+    auto device_privkey = PrivateKey::Generate(KeyType::X25519);
+    auto device_pubkey = PublicKey::FromPrivateKey(device_privkey);
 
-    // Create software and manifest
+    // Create Root CA (self-signed)
+    DeviceMetadata root_meta;
+    root_meta.hardware_id = "ROOT-CA";
+    root_meta.manufacturer = "Acme Corp";
+    root_meta.device_type = "Root-CA";
+
+    Manifest root_manifest;
+    root_manifest.SetManifestVersion(1);
+    auto root_cert = CreateCertificateWithManifest(
+        root_manifest,
+        root_privkey,
+        root_pubkey,
+        root_meta,
+        "Root CA",
+        3650,
+        nullptr  // self-signed
+    );
+
+    // Create Intermediate CA (signed by root)
+    DeviceMetadata intermediate_meta;
+    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
+    intermediate_meta.manufacturer = "Acme Corp";
+    intermediate_meta.device_type = "Intermediate-CA";
+
+    Manifest intermediate_manifest;
+    intermediate_manifest.SetManifestVersion(1);
+    auto intermediate_cert = CreateCertificateWithManifest(
+        intermediate_manifest,
+        root_privkey,  // Signed by root
+        intermediate_pubkey,
+        intermediate_meta,
+        "Intermediate CA",
+        1825,
+        &root_cert
+    );
+
+    // Create software and use ManifestBuilder to create proper update cert
     std::vector<uint8_t> software = {0x01, 0x02, 0x03, 0x04, 0x05};
+    auto encrypted_artifact = EncryptSoftware(software);
 
-    Manifest manifest;
-    manifest.SetManifestVersion(100);
-
-    SoftwareArtifact artifact;
-    artifact.name = "firmware";
-    artifact.hash_algorithm = "SHA-256";
-    artifact.expected_hash = SHA256::Hash(software);
-    artifact.signature_algorithm = "Ed25519";
-    artifact.signature = Ed25519::Sign(backend_privkey, software);
-    artifact.size = software.size();
-    manifest.AddArtifact(artifact);
-
-    manifest.SetMetadata("version", "1.0.0");
-
-    // Create device metadata
     DeviceMetadata device_meta;
     device_meta.hardware_id = "TEST-DEVICE-12345";
     device_meta.manufacturer = "Acme Corp";
     device_meta.device_type = "ESP32-Gateway";
     device_meta.hardware_version = "v2.1";
 
-    // Create certificate with embedded manifest and device metadata
-    auto cert = CreateCertificateWithManifest(
-        manifest,
-        backend_privkey,
-        backend_pubkey,
+    ManifestBuilder builder(intermediate_privkey, intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{1, 0, 0, "", ""})
+        .SetInstallOrder(0);
+    builder.AddMetadata("version", "1.0.0");
+
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pubkey,
         device_meta,
-        "Workshop Update Cert",
+        100,  // manifest_version
         365
     );
 
     // Verify certificate has both extensions
-    EXPECT_TRUE(cert.HasManifestExtension());
-    EXPECT_TRUE(cert.HasDeviceMetadata());
+    EXPECT_TRUE(update_cert.HasManifestExtension());
+    EXPECT_TRUE(update_cert.HasDeviceMetadata());
 
-    // Extract and verify device metadata
-    auto device_metadata = cert.GetDeviceMetadata();
+    // Extract and verify device metadata using proper root CA
+    auto device_metadata = update_cert.GetDeviceMetadata(root_cert, time(nullptr));
     EXPECT_EQ(device_metadata.hardware_id, "TEST-DEVICE-12345");
     EXPECT_EQ(device_metadata.manufacturer, "Acme Corp");
     EXPECT_EQ(device_metadata.device_type, "ESP32-Gateway");
     EXPECT_EQ(device_metadata.hardware_version, "v2.1");
 
-    // Extract and verify manifest from certificate (self-signed, so verify against itself)
-    auto manifest_data = cert.GetVerifiedManifest(cert, time(nullptr));
+    // Verify operational metadata
+    EXPECT_EQ(device_metadata.manifest_version, 100);
+    EXPECT_EQ(device_metadata.provides.size(), 1);
+    EXPECT_EQ(device_metadata.provides[0].name, "firmware");
+
+    // Extract and verify manifest from certificate
+    auto manifest_data = update_cert.GetVerifiedManifest(root_cert, time(nullptr));
     EXPECT_FALSE(manifest_data.empty());
 
     // Parse extracted manifest
@@ -449,19 +488,7 @@ TEST(IntegrationTest, ManifestEmbeddedInCertificate) {
     EXPECT_EQ(extracted_manifest.GetManifestVersion(), 100);
     EXPECT_EQ(extracted_manifest.GetArtifacts().size(), 1);
     EXPECT_EQ(extracted_manifest.GetArtifacts()[0].name, "firmware");
-    EXPECT_EQ(extracted_manifest.GetArtifacts()[0].expected_hash, artifact.expected_hash);
     EXPECT_EQ(extracted_manifest.GetMetadata("version").value(), "1.0.0");
-
-    // Verify software using extracted manifest
-    auto computed_hash = SHA256::Hash(software);
-    EXPECT_EQ(computed_hash, extracted_manifest.GetArtifacts()[0].expected_hash);
-
-    auto pubkey_from_cert = cert.GetPublicKey();
-    EXPECT_TRUE(Ed25519::Verify(
-        pubkey_from_cert,
-        software,
-        extracted_manifest.GetArtifacts()[0].signature
-    ));
 }
 
 // ============================================================================
@@ -519,12 +546,13 @@ TEST(IntegrationTest, RejectTamperedDeviceMetadata) {
     // Load tampered certificate
     auto tampered_cert = Certificate::LoadFromDER(tampered_cert_der);
 
-    // Verify the tampered data is present
-    auto tampered_meta = tampered_cert.GetDeviceMetadata();
-    EXPECT_EQ(tampered_meta.hardware_id, "DEVICE-999") << "Tampering changed the data";
-
-    // CRITICAL: Signature verification should FAIL on tampered certificate
+    // CRITICAL: GetDeviceMetadata should THROW because signature verification fails
     // The X.509 signature covers ALL fields including extensions
+    EXPECT_THROW({
+        auto tampered_meta = tampered_cert.GetDeviceMetadata(tampered_cert, time(nullptr));
+    }, CryptoError) << "Tampered certificate MUST fail verification";
+
+    // Signature verification should also FAIL
     EXPECT_FALSE(tampered_cert.VerifyChain(tampered_cert, time(nullptr)))
         << "Tampered certificate MUST fail signature verification";
 }
@@ -653,94 +681,108 @@ TEST(IntegrationTest, CertificateSignatureProtectsExtensions) {
 
 // Test proper CA hierarchy with separate CA and end-entity certificates
 TEST(IntegrationTest, ProperCAHierarchyVerification) {
-    // Create CA key pair
-    auto ca_privkey = PrivateKey::Generate(KeyType::Ed25519);
-    auto ca_pubkey = PublicKey::FromPrivateKey(ca_privkey);
+    // Create proper 3-tier PKI: Root CA → Intermediate CA → Update Cert
 
-    // Create end-entity key pair
-    auto ee_privkey = PrivateKey::Generate(KeyType::Ed25519);
-    auto ee_pubkey = PublicKey::FromPrivateKey(ee_privkey);
+    // Root CA
+    auto root_privkey = PrivateKey::Generate(KeyType::Ed25519);
+    auto root_pubkey = PublicKey::FromPrivateKey(root_privkey);
+
+    Manifest root_manifest;
+    root_manifest.SetManifestVersion(1);
+    DeviceMetadata root_meta;
+    root_meta.hardware_id = "ROOT-CA";
+    root_meta.manufacturer = "TestCA";
+    root_meta.device_type = "CA";
+
+    auto root_cert = CreateCertificateWithManifest(
+        root_manifest,
+        root_privkey,  // Self-signed
+        root_pubkey,
+        root_meta,
+        "Root CA",
+        3650,
+        nullptr
+    );
+
+    // Intermediate CA
+    auto intermediate_privkey = PrivateKey::Generate(KeyType::Ed25519);
+    auto intermediate_pubkey = PublicKey::FromPrivateKey(intermediate_privkey);
+
+    Manifest intermediate_manifest;
+    intermediate_manifest.SetManifestVersion(1);
+    DeviceMetadata intermediate_meta;
+    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
+    intermediate_meta.manufacturer = "TestCA";
+    intermediate_meta.device_type = "Intermediate-CA";
+
+    auto intermediate_cert = CreateCertificateWithManifest(
+        intermediate_manifest,
+        root_privkey,  // Signed by root
+        intermediate_pubkey,
+        intermediate_meta,
+        "Intermediate CA",
+        1825,
+        &root_cert
+    );
+
+    // Update certificate
+    auto device_privkey = PrivateKey::Generate(KeyType::X25519);
+    auto device_pubkey = PublicKey::FromPrivateKey(device_privkey);
 
     std::vector<uint8_t> software = {0x11, 0x22, 0x33};
-
-    Manifest manifest;
-    manifest.SetManifestVersion(42);
-
-    SoftwareArtifact artifact;
-    artifact.name = "firmware";
-    artifact.hash_algorithm = "SHA-256";
-    artifact.expected_hash = SHA256::Hash(software);
-    artifact.signature_algorithm = "Ed25519";
-    artifact.signature = Ed25519::Sign(ee_privkey, software);
-    artifact.size = software.size();
-    manifest.AddArtifact(artifact);
+    auto encrypted_artifact = EncryptSoftware(software);
 
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-CA-TEST";
     device_meta.manufacturer = "TestCorp";
     device_meta.device_type = "TestDevice";
 
-    // Create certificate signed by CA private key
-    auto ee_cert = CreateCertificateWithManifest(
-        manifest,
-        ca_privkey,  // Signed by CA
-        ee_pubkey,   // Subject is end-entity
-        device_meta
+    ManifestBuilder builder(intermediate_privkey, intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{1, 0, 0, "", ""});
+
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pubkey,
+        device_meta,
+        42,  // manifest_version
+        365
     );
-
-    // Create a self-signed CA certificate for verification
-    Manifest ca_manifest;
-    ca_manifest.SetManifestVersion(1);
-    DeviceMetadata ca_meta;
-    ca_meta.hardware_id = "CA-ROOT";
-    ca_meta.manufacturer = "TestCA";
-    ca_meta.device_type = "CA";
-
-    auto ca_cert = CreateCertificateWithManifest(
-        ca_manifest,
-        ca_privkey,  // Self-signed
-        ca_pubkey,
-        ca_meta
-    );
-
-    // Verify the end-entity certificate against CA
-    EXPECT_TRUE(ee_cert.VerifyChain(ca_cert, time(nullptr)))
-        << "End-entity cert should verify against CA cert";
 
     // Can extract verified manifest and metadata
-    auto verified_manifest_data = ee_cert.GetVerifiedManifest(ca_cert, time(nullptr));
+    auto verified_manifest_data = update_cert.GetVerifiedManifest(root_cert, time(nullptr));
     auto verified_manifest = Manifest::LoadFromProtobuf(verified_manifest_data);
     EXPECT_EQ(verified_manifest.GetManifestVersion(), 42);
 
-    auto verified_meta = ee_cert.GetVerifiedDeviceMetadata(ca_cert, time(nullptr));
+    auto verified_meta = update_cert.GetDeviceMetadata(root_cert, time(nullptr));
     EXPECT_EQ(verified_meta.hardware_id, "DEVICE-CA-TEST");
 
-    // Create a different CA key pair
-    auto wrong_ca_privkey = PrivateKey::Generate(KeyType::Ed25519);
-    auto wrong_ca_pubkey = PublicKey::FromPrivateKey(wrong_ca_privkey);
+    // Create a different root CA
+    auto wrong_root_privkey = PrivateKey::Generate(KeyType::Ed25519);
+    auto wrong_root_pubkey = PublicKey::FromPrivateKey(wrong_root_privkey);
 
-    Manifest wrong_ca_manifest;
-    wrong_ca_manifest.SetManifestVersion(1);
-    DeviceMetadata wrong_ca_meta;
-    wrong_ca_meta.hardware_id = "WRONG-CA";
-    wrong_ca_meta.manufacturer = "WrongCA";
-    wrong_ca_meta.device_type = "CA";
+    Manifest wrong_root_manifest;
+    wrong_root_manifest.SetManifestVersion(1);
+    DeviceMetadata wrong_root_meta;
+    wrong_root_meta.hardware_id = "WRONG-ROOT-CA";
+    wrong_root_meta.manufacturer = "WrongCA";
+    wrong_root_meta.device_type = "CA";
 
-    auto wrong_ca_cert = CreateCertificateWithManifest(
-        wrong_ca_manifest,
-        wrong_ca_privkey,
-        wrong_ca_pubkey,
-        wrong_ca_meta
+    auto wrong_root_cert = CreateCertificateWithManifest(
+        wrong_root_manifest,
+        wrong_root_privkey,
+        wrong_root_pubkey,
+        wrong_root_meta,
+        "Wrong Root CA",
+        3650,
+        nullptr
     );
 
-    // Verification should fail with wrong CA
-    EXPECT_FALSE(ee_cert.VerifyChain(wrong_ca_cert, time(nullptr)))
-        << "End-entity cert should NOT verify against wrong CA";
-
-    // GetVerifiedManifest should throw with wrong CA
+    // GetVerifiedManifest should throw with wrong root CA
     EXPECT_THROW({
-        auto manifest_data = ee_cert.GetVerifiedManifest(wrong_ca_cert, time(nullptr));
-    }, CryptoError) << "Should reject manifest when verified with wrong CA";
+        auto manifest_data = update_cert.GetVerifiedManifest(wrong_root_cert, time(nullptr));
+    }, CryptoError) << "Should reject manifest when verified with wrong root CA";
 }
 
 // Test timestamp validation for certificate expiration
@@ -827,13 +869,15 @@ TEST(IntegrationTest, InvalidJSONInExtensions) {
         std::vector<uint8_t> tampered_cert_der(cert_str.begin(), cert_str.end());
 
         // Try to load the tampered certificate
-        // The certificate structure itself may load, but JSON parsing should fail
+        // The certificate structure itself may load, but signature verification should fail
         try {
             auto tampered_cert = Certificate::LoadFromDER(tampered_cert_der);
 
-            // GetDeviceMetadata should throw when parsing corrupt protobuf
-            EXPECT_THROW(tampered_cert.GetDeviceMetadata(), std::runtime_error)
-                << "Corrupt protobuf should fail to parse";
+            // GetDeviceMetadata should throw when signature verification fails
+            // (corrupt protobuf will cause X.509 signature verification to fail)
+            EXPECT_THROW({
+                tampered_cert.GetDeviceMetadata(tampered_cert, time(nullptr));
+            }, CryptoError) << "Corrupt certificate should fail verification";
 
         } catch (const CryptoError& e) {
             // Certificate loading might fail due to corruption - that's also acceptable
@@ -941,9 +985,10 @@ TEST(IntegrationTest, ManifestSignatureVerification) {
     // Set signing certificate in manifest
     manifest.SetSigningCertificate(ca_cert.ToDER());
 
-    // Sign the manifest using ManifestGenerator
-    ManifestGenerator generator(ca_privkey, ca_cert);
-    generator.SignManifest(manifest);
+    // Sign the manifest (inline - same logic as ManifestBuilder)
+    auto manifest_protobuf = manifest.ToProtobufForSigning();
+    auto signature = Ed25519::Sign(ca_privkey, manifest_protobuf);
+    manifest.SetSignature(signature);
 
     // Verify signature is set
     ASSERT_FALSE(manifest.GetSignature().empty()) << "Signature should be set";
@@ -983,9 +1028,10 @@ TEST(IntegrationTest, ManifestSignatureExcludesSignatureField) {
     auto cert = CreateCertificateWithManifest(cert_manifest, privkey, pubkey, meta);
     manifest.SetSigningCertificate(cert.ToDER());
 
-    // Sign the manifest
-    ManifestGenerator generator(privkey, cert);
-    generator.SignManifest(manifest);
+    // Sign the manifest (inline)
+    auto manifest_protobuf = manifest.ToProtobufForSigning();
+    auto signature = Ed25519::Sign(privkey, manifest_protobuf);
+    manifest.SetSignature(signature);
 
     auto signature1 = manifest.GetSignature();
     ASSERT_FALSE(signature1.empty());
@@ -993,7 +1039,9 @@ TEST(IntegrationTest, ManifestSignatureExcludesSignatureField) {
     // Sign it again - signature should be IDENTICAL
     // (If signature field was included in signing, this would fail because
     //  the signature would be different each time due to including itself)
-    generator.SignManifest(manifest);
+    auto manifest_protobuf2 = manifest.ToProtobufForSigning();
+    auto signature2_val = Ed25519::Sign(privkey, manifest_protobuf2);
+    manifest.SetSignature(signature2_val);
     auto signature2 = manifest.GetSignature();
 
     // Ed25519 is deterministic - same input = same signature
@@ -1179,25 +1227,51 @@ TEST(IntegrationTest, RejectWrongIntermediate) {
 
     // Create update certificate signed by intermediate1
     std::vector<uint8_t> software = {1, 2, 3, 4};
-    ManifestGenerator generator(intermediate1_key, intermediate1_cert);
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
     device_meta.manufacturer = "Test";
     device_meta.device_type = "Device";
 
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, device_meta, 1, true, 90
+    // Encrypt software and build manifest
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(intermediate1_key, intermediate1_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 1, "", ""});
+
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 1, 90
+    );
+    auto encrypted = encrypted_files.at("firmware");
+
+    // update_cert has intermediate1 embedded (from BuildCertificate)
+    // Validator uses the root_cert - validation should succeed because intermediate1 is signed by root
+    ManifestValidator validator(root_cert, device_key);
+
+    // This should succeed - intermediate1 (embedded) is correctly signed by root
+    EXPECT_NO_THROW({
+        validator.ValidateCertificate(update_cert, time(nullptr));
+    });
+
+    // Now test with WRONG root CA - should fail
+    auto wrong_root_key = PrivateKey::Generate(KeyType::Ed25519);
+    auto wrong_root_pub = PublicKey::FromPrivateKey(wrong_root_key);
+    Manifest wrong_root_manifest;
+    wrong_root_manifest.SetManifestVersion(1);
+    DeviceMetadata wrong_root_meta;
+    wrong_root_meta.hardware_id = "WRONG-ROOT";
+    wrong_root_meta.manufacturer = "Test";
+    wrong_root_meta.device_type = "CA";
+    auto wrong_root_cert = CreateCertificateWithManifest(
+        wrong_root_manifest, wrong_root_key, wrong_root_pub, wrong_root_meta,
+        "Wrong Root CA", 3650
     );
 
-    // Try to verify with intermediate2 (WRONG intermediate) - should fail
-    std::vector<Certificate> wrong_intermediates;
-    wrong_intermediates.push_back(std::move(intermediate2_cert));
-
-    ManifestValidator validator(root_cert, wrong_intermediates, device_key);
-
+    ManifestValidator validator_wrong_root(wrong_root_cert, device_key);
     EXPECT_THROW({
-        validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject update cert verified with wrong intermediate";
+        validator_wrong_root.ValidateCertificate(update_cert, time(nullptr));
+    }, CryptoError) << "Should reject update cert when intermediate not signed by provided root";
 }
 
 TEST(IntegrationTest, RejectNonSelfSignedRootCA) {
@@ -1236,19 +1310,26 @@ TEST(IntegrationTest, RejectNonSelfSignedRootCA) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     std::vector<uint8_t> software = {1, 2, 3, 4};
-    ManifestGenerator generator(root_key, fake_root);
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
     device_meta.manufacturer = "Test";
     device_meta.device_type = "Device";
 
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, device_meta, 1, true, 90
-    );
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(root_key, fake_root);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 1, "", ""});
 
-    // Try to use fake_root as root CA - should fail DN check
-    std::vector<Certificate> intermediates;
-    ManifestValidator validator(fake_root, intermediates, device_key);
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 1, 90
+    );
+    auto encrypted = encrypted_files.at("firmware");
+
+    // update_cert has fake_root embedded as intermediate
+    // Try to use fake_root as root CA - should fail because fake_root is not self-signed
+    ManifestValidator validator(fake_root, device_key);
 
     EXPECT_THROW({
         validator.ValidateCertificate(update_cert, time(nullptr));
@@ -1259,41 +1340,88 @@ TEST(IntegrationTest, RejectNonSelfSignedRootCA) {
 // Anti-Rollback Protection Tests
 // ============================================================================
 
-TEST(IntegrationTest, AntiRollbackPreventsOlderVersion) {
-    // Setup keys
-    auto backend_key = PrivateKey::Generate(KeyType::Ed25519);
-    auto backend_pub = PublicKey::FromPrivateKey(backend_key);
-    auto device_key = PrivateKey::Generate(KeyType::X25519);
-    auto device_pub = PublicKey::FromPrivateKey(device_key);
+class AntiRollbackTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Create proper 3-tier PKI
+        auto root_privkey = PrivateKey::Generate(KeyType::Ed25519);
+        auto root_pubkey = PublicKey::FromPrivateKey(root_privkey);
 
-    // Create backend cert (self-signed)
-    DeviceMetadata backend_meta;
-    backend_meta.hardware_id = "BACKEND";
-    backend_meta.manufacturer = "TestCorp";
-    backend_meta.device_type = "Backend";
+        DeviceMetadata root_meta;
+        root_meta.hardware_id = "ROOT-CA";
+        root_meta.manufacturer = "TestCorp";
+        root_meta.device_type = "Root-CA";
 
-    Manifest dummy;
-    dummy.SetManifestVersion(1);
-    auto backend_cert = CreateCertificateWithManifest(
-        dummy, backend_key, backend_pub, backend_meta
-    );
+        Manifest root_manifest;
+        root_manifest.SetManifestVersion(1);
+        root_cert = CreateCertificateWithManifest(
+            root_manifest, root_privkey, root_pubkey, root_meta,
+            "Root CA", 3650, nullptr
+        );
 
-    ManifestGenerator generator(backend_key, backend_cert);
+        // Intermediate CA
+        intermediate_key = PrivateKey::Generate(KeyType::Ed25519);
+        auto intermediate_pub = PublicKey::FromPrivateKey(intermediate_key);
+
+        DeviceMetadata intermediate_meta;
+        intermediate_meta.hardware_id = "INTERMEDIATE";
+        intermediate_meta.manufacturer = "TestCorp";
+        intermediate_meta.device_type = "Intermediate-CA";
+
+        Manifest intermediate_manifest;
+        intermediate_manifest.SetManifestVersion(1);
+        intermediate_cert = CreateCertificateWithManifest(
+            intermediate_manifest, root_privkey, intermediate_pub, intermediate_meta,
+            "Intermediate CA", 1825, &root_cert
+        );
+
+        // Device keys
+        device_key = PrivateKey::Generate(KeyType::X25519);
+        device_pub = PublicKey::FromPrivateKey(device_key);
+
+        device_meta.hardware_id = "TEST-DEVICE";
+        device_meta.manufacturer = "TestCorp";
+        device_meta.device_type = "TestDevice";
+    }
+
+    Certificate root_cert;
+    PrivateKey intermediate_key;
+    Certificate intermediate_cert;
+    PrivateKey device_key;
+    PublicKey device_pub;
+    DeviceMetadata device_meta;
+};
+
+TEST_F(AntiRollbackTest, AntiRollbackPreventsOlderVersion) {
 
     // Create two updates with different versions
     std::vector<uint8_t> software_v42 = {0x42, 0x42, 0x42};
     std::vector<uint8_t> software_v41 = {0x41, 0x41, 0x41};
 
-    auto [cert_v42, encrypted_v42] = generator.CreateCertificate(
-        software_v42, device_pub, backend_meta, 42, true, 90
+    auto encrypted_v42 = EncryptSoftware(software_v42);
+    ManifestBuilder builder_v42(intermediate_key, intermediate_cert);
+    builder_v42.AddArtifact("firmware", encrypted_v42)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 42, "", ""});
+    auto [cert_v42, encrypted_files_v42] = builder_v42.BuildCertificate(
+        device_pub, device_meta, 42, 90
     );
+    auto encrypted_v42_data = encrypted_files_v42.at("firmware");
 
-    auto [cert_v41, encrypted_v41] = generator.CreateCertificate(
-        software_v41, device_pub, backend_meta, 41, true, 90
+    auto encrypted_v41 = EncryptSoftware(software_v41);
+    ManifestBuilder builder_v41(intermediate_key, intermediate_cert);
+    builder_v41.AddArtifact("firmware", encrypted_v41)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 41, "", ""});
+    auto [cert_v41, encrypted_files_v41] = builder_v41.BuildCertificate(
+        device_pub, device_meta, 41, 90
     );
+    auto encrypted_v41_data = encrypted_files_v41.at("firmware");
 
     // Validator starts with no version constraint
-    ManifestValidator validator(backend_cert, device_key);
+    ManifestValidator validator(root_cert, device_key);
 
     // First update succeeds (version 42)
     auto manifest_v42 = validator.ValidateCertificate(cert_v42, time(nullptr));
@@ -1308,32 +1436,20 @@ TEST(IntegrationTest, AntiRollbackPreventsOlderVersion) {
     }, CryptoError) << "Should reject older version (rollback attack)";
 }
 
-TEST(IntegrationTest, AntiRollbackPreventsReplay) {
-    // Setup
-    auto backend_key = PrivateKey::Generate(KeyType::Ed25519);
-    auto backend_pub = PublicKey::FromPrivateKey(backend_key);
-    auto device_key = PrivateKey::Generate(KeyType::X25519);
-    auto device_pub = PublicKey::FromPrivateKey(device_key);
-
-    DeviceMetadata backend_meta;
-    backend_meta.hardware_id = "BACKEND";
-    backend_meta.manufacturer = "TestCorp";
-    backend_meta.device_type = "Backend";
-
-    Manifest dummy;
-    dummy.SetManifestVersion(1);
-    auto backend_cert = CreateCertificateWithManifest(
-        dummy, backend_key, backend_pub, backend_meta
-    );
-
-    ManifestGenerator generator(backend_key, backend_cert);
-
+TEST_F(AntiRollbackTest, AntiRollbackPreventsReplay) {
     std::vector<uint8_t> software = {0x42, 0x42, 0x42};
-    auto [cert_v42, encrypted] = generator.CreateCertificate(
-        software, device_pub, backend_meta, 42, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(intermediate_key, intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 42, "", ""});
+    auto [cert_v42, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 42, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    ManifestValidator validator(backend_cert, device_key);
+    ManifestValidator validator(root_cert, device_key);
 
     // First installation succeeds
     auto manifest = validator.ValidateCertificate(cert_v42, time(nullptr));
@@ -1348,38 +1464,33 @@ TEST(IntegrationTest, AntiRollbackPreventsReplay) {
     }, CryptoError) << "Should reject same version (replay attack)";
 }
 
-TEST(IntegrationTest, AntiRollbackAllowsNewerVersion) {
-    // Setup
-    auto backend_key = PrivateKey::Generate(KeyType::Ed25519);
-    auto backend_pub = PublicKey::FromPrivateKey(backend_key);
-    auto device_key = PrivateKey::Generate(KeyType::X25519);
-    auto device_pub = PublicKey::FromPrivateKey(device_key);
-
-    DeviceMetadata backend_meta;
-    backend_meta.hardware_id = "BACKEND";
-    backend_meta.manufacturer = "TestCorp";
-    backend_meta.device_type = "Backend";
-
-    Manifest dummy;
-    dummy.SetManifestVersion(1);
-    auto backend_cert = CreateCertificateWithManifest(
-        dummy, backend_key, backend_pub, backend_meta
-    );
-
-    ManifestGenerator generator(backend_key, backend_cert);
-
+TEST_F(AntiRollbackTest, AntiRollbackAllowsNewerVersion) {
     std::vector<uint8_t> software_v42 = {0x42, 0x42, 0x42};
     std::vector<uint8_t> software_v43 = {0x43, 0x43, 0x43};
 
-    auto [cert_v42, encrypted_v42] = generator.CreateCertificate(
-        software_v42, device_pub, backend_meta, 42, true, 90
+    auto encrypted_v42 = EncryptSoftware(software_v42);
+    ManifestBuilder builder_v42(intermediate_key, intermediate_cert);
+    builder_v42.AddArtifact("firmware", encrypted_v42)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 42, "", ""});
+    auto [cert_v42, encrypted_files_v42] = builder_v42.BuildCertificate(
+        device_pub, device_meta, 42, 90
     );
+    auto encrypted_v42_data = encrypted_files_v42.at("firmware");
 
-    auto [cert_v43, encrypted_v43] = generator.CreateCertificate(
-        software_v43, device_pub, backend_meta, 43, true, 90
+    auto encrypted_v43 = EncryptSoftware(software_v43);
+    ManifestBuilder builder_v43(intermediate_key, intermediate_cert);
+    builder_v43.AddArtifact("firmware", encrypted_v43)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 43, "", ""});
+    auto [cert_v43, encrypted_files_v43] = builder_v43.BuildCertificate(
+        device_pub, device_meta, 43, 90
     );
+    auto encrypted_v43_data = encrypted_files_v43.at("firmware");
 
-    ManifestValidator validator(backend_cert, device_key);
+    ManifestValidator validator(root_cert, device_key);
 
     // Install v42
     auto manifest_v42 = validator.ValidateCertificate(cert_v42, time(nullptr));
@@ -1437,15 +1548,19 @@ TEST(IntegrationTest, RevokeCertificateByTimestamp) {
 
     // Create update certificate signed by old intermediate
     std::vector<uint8_t> software = {0x01, 0x02, 0x03};
-    ManifestGenerator generator(intermediate_key, old_intermediate_cert);
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, intermediate_meta, 100, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(intermediate_key, old_intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 100, "", ""});
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, intermediate_meta, 100, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    // Validator with old intermediate CA
-    std::vector<Certificate> intermediates;
-    intermediates.push_back(Certificate::LoadFromDER(old_intermediate_cert.ToDER()));
-    ManifestValidator validator(root_cert, intermediates, device_key);
+    // update_cert has old_intermediate_cert embedded (from BuildCertificate)
+    ManifestValidator validator(root_cert, device_key);
 
     // First update succeeds (old intermediate is trusted)
     EXPECT_NO_THROW({
@@ -1461,9 +1576,10 @@ TEST(IntegrationTest, RevokeCertificateByTimestamp) {
     validator.SetRejectCertificatesBefore(revocation_timestamp);
 
     // Try to use update signed by old intermediate - should FAIL
+    // Validator checks embedded intermediate's issuance time
     EXPECT_THROW({
         validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject certificate signed by revoked intermediate";
+    }, CryptoError) << "Should reject certificate with revoked embedded intermediate";
 }
 
 TEST(IntegrationTest, NewIntermediateAfterRevocation) {
@@ -1521,15 +1637,19 @@ TEST(IntegrationTest, NewIntermediateAfterRevocation) {
 
     // Create update with NEW intermediate
     std::vector<uint8_t> software = {0x01, 0x02, 0x03};
-    ManifestGenerator generator(new_intermediate_key, new_intermediate_cert);
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, intermediate_meta, 100, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(new_intermediate_key, new_intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 100, "", ""});
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, intermediate_meta, 100, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    // Validator with NEW intermediate and revocation policy
-    std::vector<Certificate> intermediates;
-    intermediates.push_back(Certificate::LoadFromDER(new_intermediate_cert.ToDER()));
-    ManifestValidator validator(root_cert, intermediates, device_key);
+    // update_cert has new_intermediate_cert embedded (from BuildCertificate)
+    ManifestValidator validator(root_cert, device_key);
     validator.SetRejectCertificatesBefore(revocation_timestamp);
 
     // Update with new intermediate should SUCCEED
@@ -1559,23 +1679,29 @@ TEST(IntegrationTest, RejectChainWithNoIntermediates) {
 
     // Create update certificate signed directly by root (no intermediate)
     std::vector<uint8_t> software = {1, 2, 3, 4};
-    ManifestGenerator generator(root_key, root_cert);
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
     device_meta.manufacturer = "Test";
     device_meta.device_type = "Device";
 
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, device_meta, 1, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(root_key, root_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 1, "", ""});
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 1, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    // Validator with NO intermediates (depth = 0, required = 1)
-    std::vector<Certificate> no_intermediates;
-    ManifestValidator validator(root_cert, no_intermediates, device_key);
+    // update_cert has root_cert embedded as "intermediate" (from BuildCertificate)
+    // But root_cert is self-signed, so validation should reject this
+    ManifestValidator validator(root_cert, device_key);
 
     EXPECT_THROW({
         validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject chain with 0 intermediates (required 1)";
+    }, CryptoError) << "Should reject self-signed intermediate (opinionated: must have proper 3-tier PKI)";
 }
 
 TEST(IntegrationTest, RejectChainWithTooManyIntermediates) {
@@ -1626,26 +1752,39 @@ TEST(IntegrationTest, RejectChainWithTooManyIntermediates) {
 
     // Create update certificate signed by intermediate2
     std::vector<uint8_t> software = {1, 2, 3, 4};
-    ManifestGenerator generator(intermediate2_key, intermediate2_cert);
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
     device_meta.manufacturer = "Test";
     device_meta.device_type = "Device";
 
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, device_meta, 1, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(intermediate2_key, intermediate2_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 1, "", ""});
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 1, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    // Validator with 2 intermediates (depth = 2, required = 1)
-    std::vector<Certificate> intermediates;
-    intermediates.push_back(Certificate::LoadFromDER(intermediate2_cert.ToDER()));
-    intermediates.push_back(Certificate::LoadFromDER(intermediate1_cert.ToDER()));
+    // update_cert has intermediate2_cert embedded (from BuildCertificate)
+    // Create a PEM bundle with 2 intermediates to test rejection
+    std::string pem_bundle = update_cert.ToPEM() +
+                             intermediate2_cert.ToPEM() +
+                             intermediate1_cert.ToPEM();
 
-    ManifestValidator validator(root_cert, intermediates, device_key);
+    // Write to temp file and load (LoadFromFile allows any number)
+    const char* temp_file = "/tmp/test_two_intermediates.pem";
+    std::ofstream ofs(temp_file);
+    ofs << pem_bundle;
+    ofs.close();
 
+    // LoadFromFile should reject because bundle has 3 certificates (update + 2 intermediates)
+    // Opinionated: expect 1 for CA or 2 for update cert (fail fast at load time)
     EXPECT_THROW({
-        validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject chain with 2 intermediates (required 1)";
+        Certificate::LoadFromFile(temp_file);
+    }, CryptoError) << "Should reject bundle with 2 intermediates at load time (opinionated: exactly 1 intermediate required)";
 }
 
 TEST(IntegrationTest, RejectSelfSignedIntermediate) {
@@ -1682,21 +1821,25 @@ TEST(IntegrationTest, RejectSelfSignedIntermediate) {
 
     // Create update certificate signed by intermediate
     std::vector<uint8_t> software = {1, 2, 3, 4};
-    ManifestGenerator generator(intermediate_key, intermediate_cert);
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
     device_meta.manufacturer = "Test";
     device_meta.device_type = "Device";
 
-    auto [update_cert, encrypted] = generator.CreateCertificate(
-        software, device_pub, device_meta, 1, true, 90
+    auto encrypted_artifact = EncryptSoftware(software);
+    ManifestBuilder builder(intermediate_key, intermediate_cert);
+    builder.AddArtifact("firmware", encrypted_artifact)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{0, 0, 1, "", ""});
+    auto [update_cert, encrypted_files] = builder.BuildCertificate(
+        device_pub, device_meta, 1, 90
     );
+    auto encrypted = encrypted_files.at("firmware");
 
-    // Validator with self-signed intermediate
-    std::vector<Certificate> intermediates;
-    intermediates.push_back(Certificate::LoadFromDER(intermediate_cert.ToDER()));
-
-    ManifestValidator validator(root_cert, intermediates, device_key);
+    // update_cert has self-signed intermediate_cert embedded (from BuildCertificate)
+    // Validation should fail because intermediate is self-signed, not signed by root
+    ManifestValidator validator(root_cert, device_key);
 
     EXPECT_THROW({
         validator.ValidateCertificate(update_cert, time(nullptr));

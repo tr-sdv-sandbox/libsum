@@ -20,6 +20,7 @@
 #include <openssl/asn1.h>
 #include <openssl/objects.h>
 #include <openssl/rand.h>
+#include <glog/logging.h>
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -233,10 +234,14 @@ void* PublicKey::GetNativeHandle() const {
 class Certificate::Impl {
 public:
     X509* cert = nullptr;
+    X509* intermediate = nullptr;  // Single intermediate certificate (opinionated: exactly 1)
 
     ~Impl() {
         if (cert) {
             X509_free(cert);
+        }
+        if (intermediate) {
+            X509_free(intermediate);
         }
     }
 };
@@ -248,69 +253,73 @@ Certificate::~Certificate() = default;
 Certificate::Certificate(Certificate&&) noexcept = default;
 Certificate& Certificate::operator=(Certificate&&) noexcept = default;
 
+namespace {
+    // Helper: Load raw X509 certificates from PEM string
+    std::vector<X509*> LoadX509ChainFromPEM(const std::string& pem) {
+        BIO_ptr bio(BIO_new_mem_buf(pem.data(), pem.size()));
+        if (!bio) {
+            throw CryptoError("Failed to create BIO from PEM data");
+        }
+
+        std::vector<X509*> chain;
+
+        // Read all certificates from the PEM data
+        while (true) {
+            X509* x509 = PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr);
+            if (!x509) {
+                break;  // No more certificates
+            }
+            chain.push_back(x509);
+        }
+
+        if (chain.empty()) {
+            throw CryptoError("No certificates found in PEM data");
+        }
+
+        return chain;
+    }
+
+    // Helper: Load raw X509 certificates from file
+    std::vector<X509*> LoadX509ChainFromFile(const std::string& path) {
+        std::ifstream file(path);
+        if (!file) {
+            throw CryptoError("Failed to open certificate file: " + path);
+        }
+
+        std::string pem_data((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+
+        return LoadX509ChainFromPEM(pem_data);
+    }
+}
+
 Certificate Certificate::LoadFromFile(const std::string& path) {
-    FILE* fp = fopen(path.c_str(), "r");
-    if (!fp) {
-        throw CryptoError("Failed to open certificate file: " + path);
+    // Load as PEM file (may contain 1 or more certificates)
+    std::vector<X509*> x509_chain = LoadX509ChainFromFile(path);
+
+    if (x509_chain.empty()) {
+        throw CryptoError("No certificates found in: " + path);
     }
 
+    // First certificate is the primary certificate (CA or update cert)
     Certificate cert;
+    cert.impl_->cert = x509_chain[0];
 
-    // Try PEM first
-    cert.impl_->cert = PEM_read_X509(fp, nullptr, nullptr, nullptr);
-
-    if (!cert.impl_->cert) {
-        // Try DER
-        fseek(fp, 0, SEEK_SET);
-        cert.impl_->cert = d2i_X509_fp(fp, nullptr);
-    }
-
-    fclose(fp);
-
-    if (!cert.impl_->cert) {
-        throw CryptoError("Failed to parse certificate from: " + path);
+    // Second certificate (if present) is the intermediate
+    // For CA certificates: no intermediate (size == 1)
+    // For update certificates: exactly 1 intermediate (size == 2)
+    if (x509_chain.size() == 2) {
+        cert.impl_->intermediate = x509_chain[1];
+    } else if (x509_chain.size() > 2) {
+        // Clean up extra certificates
+        for (size_t i = 1; i < x509_chain.size(); i++) {
+            X509_free(x509_chain[i]);
+        }
+        throw CryptoError("Invalid certificate bundle: found " + std::to_string(x509_chain.size()) +
+                         " certificates (opinionated: expect 1 for CA or 2 for update cert + intermediate) in: " + path);
     }
 
     return cert;
-}
-
-std::vector<Certificate> Certificate::LoadChainFromFile(const std::string& path) {
-    std::ifstream file(path);
-    if (!file) {
-        throw CryptoError("Failed to open certificate chain file: " + path);
-    }
-
-    std::string pem_data((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
-
-    return LoadChainFromPEM(pem_data);
-}
-
-std::vector<Certificate> Certificate::LoadChainFromPEM(const std::string& pem) {
-    BIO_ptr bio(BIO_new_mem_buf(pem.data(), pem.size()));
-    if (!bio) {
-        throw CryptoError("Failed to create BIO from PEM data");
-    }
-
-    std::vector<Certificate> chain;
-
-    // Read all certificates from the PEM data
-    while (true) {
-        X509* x509 = PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr);
-        if (!x509) {
-            break;  // No more certificates
-        }
-
-        Certificate cert;
-        cert.impl_->cert = x509;
-        chain.push_back(std::move(cert));
-    }
-
-    if (chain.empty()) {
-        throw CryptoError("No certificates found in PEM data");
-    }
-
-    return chain;
 }
 
 Certificate Certificate::LoadFromDER(const std::vector<uint8_t>& der) {
@@ -352,19 +361,6 @@ std::string Certificate::ToPEM() const {
     char* data = nullptr;
     long len = BIO_get_mem_data(bio.get(), &data);
     return std::string(data, len);
-}
-
-std::string Certificate::CreateChainPEM(const std::vector<Certificate>& chain) {
-    if (chain.empty()) {
-        throw CryptoError("Cannot create PEM bundle from empty chain");
-    }
-
-    std::string pem_bundle;
-    for (const auto& cert : chain) {
-        pem_bundle += cert.ToPEM();
-    }
-
-    return pem_bundle;
 }
 
 PublicKey Certificate::GetPublicKey() const {
@@ -429,20 +425,12 @@ bool Certificate::VerifyChain(const Certificate& issuer, int64_t trusted_time) c
 }
 
 bool Certificate::VerifyChainWithIntermediates(
-    const std::vector<Certificate>& intermediates,
+    const Certificate& intermediate,
     const Certificate& root_ca,
     int64_t trusted_time
 ) const {
-    // Build certificate chain: this cert → intermediates → root_ca
-    // Verify each link in the chain
-
-    // SECURITY: Enforce required certificate chain depth
-    const size_t expected_intermediates = REQUIRED_CERT_CHAIN_DEPTH - 1;  // Chain depth - root = intermediates
-    if (intermediates.size() != expected_intermediates) {
-        throw CryptoError("Invalid certificate chain depth: expected " +
-                         std::to_string(expected_intermediates) + " intermediate(s), got " +
-                         std::to_string(intermediates.size()));
-    }
+    // Build certificate chain: this cert → intermediate → root_ca
+    // Verify each link in the chain (opinionated: exactly 1 intermediate)
 
     // SECURITY: Validate root CA is self-signed
     X509_NAME* root_subject = X509_get_subject_name(root_ca.impl_->cert);
@@ -457,100 +445,39 @@ bool Certificate::VerifyChainWithIntermediates(
         throw CryptoError("Chain validation failed: root CA signature is invalid");
     }
 
-    // SECURITY: Validate intermediates are NOT self-signed
-    for (const auto& intermediate : intermediates) {
-        X509_NAME* int_subject = X509_get_subject_name(intermediate.impl_->cert);
-        X509_NAME* int_issuer = X509_get_issuer_name(intermediate.impl_->cert);
-        if (int_subject && int_issuer && X509_NAME_cmp(int_subject, int_issuer) == 0) {
-            throw CryptoError("Chain validation failed: intermediate CA cannot be self-signed");
-        }
+    // SECURITY: Validate intermediate is NOT self-signed
+    X509_NAME* int_subject = X509_get_subject_name(intermediate.impl_->cert);
+    X509_NAME* int_issuer = X509_get_issuer_name(intermediate.impl_->cert);
+    if (int_subject && int_issuer && X509_NAME_cmp(int_subject, int_issuer) == 0) {
+        throw CryptoError("Chain validation failed: intermediate CA cannot be self-signed");
     }
 
-    // First, verify this certificate against the first intermediate (or root if no intermediates)
-    const Certificate* current_issuer = intermediates.empty() ? &root_ca : &intermediates[0];
-
-    if (!VerifyChain(*current_issuer, trusted_time)) {
+    // First, verify this certificate against the intermediate
+    if (!VerifyChain(intermediate, trusted_time)) {
         throw CryptoError("Chain verification failed: update certificate not signed by intermediate CA");
     }
 
-    // SECURITY: Validate issuer/subject DN chain order
+    // SECURITY: Validate issuer/subject DN chain order (update cert → intermediate)
     X509_NAME* subject_issuer = X509_get_issuer_name(impl_->cert);
-    X509_NAME* issuer_subject = X509_get_subject_name(current_issuer->impl_->cert);
+    X509_NAME* issuer_subject = X509_get_subject_name(intermediate.impl_->cert);
     if (!subject_issuer || !issuer_subject || X509_NAME_cmp(subject_issuer, issuer_subject) != 0) {
-        throw CryptoError("Chain validation failed: update certificate issuer DN does not match " +
-                        std::string(intermediates.empty() ? "root CA" : "intermediate CA") + " subject DN");
+        throw CryptoError("Chain validation failed: update certificate issuer DN does not match intermediate CA subject DN");
     }
 
-    // Verify each intermediate against the next one
-    for (size_t i = 0; i < intermediates.size(); ++i) {
-        const Certificate* next_issuer = (i + 1 < intermediates.size())
-            ? &intermediates[i + 1]
-            : &root_ca;
+    // Verify intermediate against root CA
+    if (!intermediate.VerifyChain(root_ca, trusted_time)) {
+        throw CryptoError("Chain verification failed: intermediate CA not signed by root CA");
+    }
 
-        if (!intermediates[i].VerifyChain(*next_issuer, trusted_time)) {
-            throw CryptoError("Chain verification failed: intermediate CA " + std::to_string(i) +
-                            " not signed by next CA in chain");
-        }
-
-        // SECURITY: Validate issuer/subject DN match
-        X509_NAME* cert_issuer = X509_get_issuer_name(intermediates[i].impl_->cert);
-        X509_NAME* next_subject = X509_get_subject_name(next_issuer->impl_->cert);
-        if (!cert_issuer || !next_subject || X509_NAME_cmp(cert_issuer, next_subject) != 0) {
-            throw CryptoError("Chain validation failed: intermediate CA " + std::to_string(i) +
-                            " issuer DN does not match next CA subject DN");
-        }
+    // SECURITY: Validate issuer/subject DN match (intermediate → root)
+    X509_NAME* int_issuer_dn = X509_get_issuer_name(intermediate.impl_->cert);
+    X509_NAME* root_subject_dn = X509_get_subject_name(root_ca.impl_->cert);
+    if (!int_issuer_dn || !root_subject_dn || X509_NAME_cmp(int_issuer_dn, root_subject_dn) != 0) {
+        throw CryptoError("Chain validation failed: intermediate CA issuer DN does not match root CA subject DN");
     }
 
     // All verifications passed
     return true;
-}
-
-std::vector<uint8_t> Certificate::GetVerifiedManifestWithChain(
-    const std::vector<Certificate>& intermediates,
-    const Certificate& root_ca,
-    int64_t trusted_time
-) const {
-    // SECURITY: Verify entire certificate chain BEFORE extracting manifest
-    if (!VerifyChainWithIntermediates(intermediates, root_ca, trusted_time)) {
-        throw CryptoError("Chain verification failed: cannot extract manifest from untrusted certificate");
-    }
-
-    // Chain verified, extract manifest (without re-verifying)
-    ASN1_OBJECT* obj = OBJ_txt2obj(internal::MANIFEST_EXTENSION_OID, 1);
-    if (!obj) {
-        throw CryptoError("Failed to create ASN1 object for manifest OID");
-    }
-
-    int ext_idx = X509_get_ext_by_OBJ(impl_->cert, obj, -1);
-    ASN1_OBJECT_free(obj);
-
-    if (ext_idx < 0) {
-        throw CryptoError("No manifest extension found in certificate");
-    }
-
-    X509_EXTENSION* ext = X509_get_ext(impl_->cert, ext_idx);
-    if (!ext) {
-        throw CryptoError("Failed to extract manifest extension");
-    }
-
-    ASN1_OCTET_STRING* data = X509_EXTENSION_get_data(ext);
-    if (!data) {
-        throw CryptoError("Failed to extract manifest data from extension");
-    }
-
-    // SECURITY: Reject manifests larger than 1MB to prevent DoS attacks
-    constexpr size_t MAX_MANIFEST_SIZE = 1024 * 1024;  // 1MB
-    size_t manifest_size = ASN1_STRING_length(data);
-    if (manifest_size > MAX_MANIFEST_SIZE) {
-        throw CryptoError("Manifest too large in certificate extension: " +
-                         std::to_string(manifest_size) + " bytes (max " +
-                         std::to_string(MAX_MANIFEST_SIZE) + " bytes)");
-    }
-
-    return std::vector<uint8_t>(
-        ASN1_STRING_get0_data(data),
-        ASN1_STRING_get0_data(data) + manifest_size
-    );
 }
 
 void* Certificate::GetNativeHandle() const {
@@ -569,39 +496,27 @@ bool Certificate::HasManifestExtension() const {
     return ext_idx >= 0;
 }
 
-std::vector<uint8_t> Certificate::GetVerifiedManifest(const Certificate& ca_cert, int64_t trusted_time) const {
-    // SECURITY: Verify certificate signature BEFORE extracting manifest
-    // Provide detailed error messages about why verification failed
+std::vector<uint8_t> Certificate::GetVerifiedManifest(const Certificate& root_ca, int64_t trusted_time) const {
+    // SECURITY: Verify entire certificate chain BEFORE extracting manifest
+    // Chain: this cert → internal intermediate → root CA
 
-    // First check signature
-    EVP_PKEY_ptr issuer_pubkey(X509_get_pubkey(ca_cert.impl_->cert));
-    if (!issuer_pubkey) {
-        throw CryptoError("Certificate verification failed: Cannot extract CA public key");
+    // Wrap internal X509* intermediate in Certificate object for verification
+    if (!impl_->intermediate) {
+        throw CryptoError("No intermediate certificate embedded (opinionated: exactly 1 required)");
     }
 
-    int result = X509_verify(impl_->cert, issuer_pubkey.get());
-    if (result != 1) {
-        throw CryptoError("Certificate verification failed: Invalid signature (certificate not signed by provided CA)");
+    Certificate intermediate_cert;
+    intermediate_cert.impl_->cert = X509_dup(impl_->intermediate);
+    if (!intermediate_cert.impl_->cert) {
+        throw CryptoError("Failed to duplicate intermediate certificate for verification");
     }
 
-    // Check time validity (REQUIRED)
-    time_t check_time = static_cast<time_t>(trusted_time);
-    const ASN1_TIME* not_before = X509_get0_notBefore(impl_->cert);
-    const ASN1_TIME* not_after = X509_get0_notAfter(impl_->cert);
-
-    if (!not_before || !not_after) {
-        throw CryptoError("Certificate verification failed: Invalid validity period");
+    // Verify the full certificate chain (includes signature + time validity checking)
+    if (!VerifyChainWithIntermediates(intermediate_cert, root_ca, trusted_time)) {
+        throw CryptoError("Chain verification failed: cannot extract manifest from untrusted certificate");
     }
 
-    if (X509_cmp_time(not_before, &check_time) > 0) {
-        throw CryptoError("Certificate verification failed: Certificate not yet valid at trusted time");
-    }
-
-    if (X509_cmp_time(not_after, &check_time) < 0) {
-        throw CryptoError("Certificate verification failed: Certificate expired at trusted time");
-    }
-
-    // Verification passed, extract manifest
+    // Chain verified, extract manifest
     ASN1_OBJECT* obj = OBJ_txt2obj(internal::MANIFEST_EXTENSION_OID, 1);
     if (!obj) {
         throw CryptoError("Failed to create manifest OID");
@@ -649,7 +564,40 @@ bool Certificate::HasDeviceMetadata() const {
     return ext_idx >= 0;
 }
 
-DeviceMetadata Certificate::GetDeviceMetadata() const {
+void Certificate::AddIntermediate(const Certificate& intermediate_cert) {
+    if (impl_->intermediate) {
+        throw CryptoError("Intermediate certificate already set (opinionated: exactly 1 intermediate)");
+    }
+
+    // Duplicate the X509 certificate and store as single intermediate
+    impl_->intermediate = X509_dup(static_cast<X509*>(intermediate_cert.impl_->cert));
+    if (!impl_->intermediate) {
+        throw CryptoError("Failed to duplicate intermediate certificate");
+    }
+}
+
+DeviceMetadata Certificate::GetDeviceMetadata(const Certificate& root_ca, int64_t trusted_time) const {
+    // SECURITY: Verify entire certificate chain BEFORE extracting device metadata
+    // Chain: this cert → internal intermediate → root CA
+    // This includes signature verification AND time validity checking for all certs in chain
+
+    // Wrap internal X509* intermediate in Certificate object for verification
+    if (!impl_->intermediate) {
+        throw CryptoError("No intermediate certificate embedded (opinionated: exactly 1 required)");
+    }
+
+    Certificate intermediate_cert;
+    intermediate_cert.impl_->cert = X509_dup(impl_->intermediate);
+    if (!intermediate_cert.impl_->cert) {
+        throw CryptoError("Failed to duplicate intermediate certificate for verification");
+    }
+
+    // Verify the full certificate chain (includes time validity checks via VerifyChain)
+    if (!VerifyChainWithIntermediates(intermediate_cert, root_ca, trusted_time)) {
+        throw CryptoError("Chain verification failed: cannot extract device metadata from untrusted certificate");
+    }
+
+    // Chain verified (signatures + time validity), extract the metadata
     constexpr const char* DEVICE_METADATA_OID = "1.3.6.1.3.1";  // libsum device metadata
 
     ASN1_OBJECT* obj = OBJ_txt2obj(DEVICE_METADATA_OID, 1);
@@ -666,52 +614,16 @@ DeviceMetadata Certificate::GetDeviceMetadata() const {
 
     X509_EXTENSION* ext = X509_get_ext(impl_->cert, ext_idx);
     if (!ext) {
-        throw CryptoError("Failed to get extension");
+        throw CryptoError("Failed to get device metadata extension");
     }
 
     ASN1_OCTET_STRING* data = X509_EXTENSION_get_data(ext);
     if (!data) {
-        throw CryptoError("Failed to get extension data");
+        throw CryptoError("Failed to get device metadata extension data");
     }
 
     std::vector<uint8_t> proto_bytes(data->data, data->data + data->length);
     return DeviceMetadata::FromProtobuf(proto_bytes);
-}
-
-DeviceMetadata Certificate::GetVerifiedDeviceMetadata(const Certificate& ca_cert, int64_t trusted_time) const {
-    // SECURITY: Verify certificate signature BEFORE extracting device metadata
-    // Provide detailed error messages about why verification failed
-
-    // First check signature
-    EVP_PKEY_ptr issuer_pubkey(X509_get_pubkey(ca_cert.impl_->cert));
-    if (!issuer_pubkey) {
-        throw CryptoError("Certificate verification failed: Cannot extract CA public key");
-    }
-
-    int result = X509_verify(impl_->cert, issuer_pubkey.get());
-    if (result != 1) {
-        throw CryptoError("Certificate verification failed: Invalid signature (certificate not signed by provided CA)");
-    }
-
-    // Check time validity (REQUIRED)
-    time_t check_time = static_cast<time_t>(trusted_time);
-    const ASN1_TIME* not_before = X509_get0_notBefore(impl_->cert);
-    const ASN1_TIME* not_after = X509_get0_notAfter(impl_->cert);
-
-    if (!not_before || !not_after) {
-        throw CryptoError("Certificate verification failed: Invalid validity period");
-    }
-
-    if (X509_cmp_time(not_before, &check_time) > 0) {
-        throw CryptoError("Certificate verification failed: Certificate not yet valid at trusted time");
-    }
-
-    if (X509_cmp_time(not_after, &check_time) < 0) {
-        throw CryptoError("Certificate verification failed: Certificate expired at trusted time");
-    }
-
-    // After verification passes, extract the metadata
-    return GetDeviceMetadata();
 }
 
 int64_t Certificate::GetNotBefore() const {
@@ -724,6 +636,27 @@ int64_t Certificate::GetNotBefore() const {
     struct tm tm_time = {};
     if (!ASN1_TIME_to_tm(not_before, &tm_time)) {
         throw CryptoError("Failed to convert ASN1_TIME to tm");
+    }
+
+    // Convert to Unix epoch (UTC)
+    time_t epoch_time = timegm(&tm_time);
+    return static_cast<int64_t>(epoch_time);
+}
+
+int64_t Certificate::GetIntermediateIssuanceTime() const {
+    if (!impl_->intermediate) {
+        throw CryptoError("No intermediate certificate embedded in this certificate");
+    }
+
+    const ASN1_TIME* not_before = X509_get0_notBefore(impl_->intermediate);
+    if (!not_before) {
+        throw CryptoError("Failed to get intermediate certificate notBefore time");
+    }
+
+    // Convert ASN1_TIME to time_t
+    struct tm tm_time = {};
+    if (!ASN1_TIME_to_tm(not_before, &tm_time)) {
+        throw CryptoError("Failed to convert intermediate ASN1_TIME to tm");
     }
 
     // Convert to Unix epoch (UTC)

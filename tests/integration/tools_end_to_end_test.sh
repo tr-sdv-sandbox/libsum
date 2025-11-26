@@ -79,7 +79,12 @@ ${BUILD_DIR}/backend/sum-generate \
   --manufacturer "Integration Test Corp" \
   --device-type "TestDevice" \
   --hardware-version "v1.0" \
-  --version 42 \
+  --artifact-name firmware \
+  --artifact-type firmware \
+  --target-ecu primary \
+  --sw-version "1.0.0" \
+  --sw-security-version 42 \
+  --manifest-version 1 \
   --validity-days 90 \
   --output update.crt \
   --encrypted-output firmware.enc > /dev/null 2>&1
@@ -115,13 +120,28 @@ fi
 DECRYPTED_SIZE=$(stat -c%s firmware_decrypted.bin)
 echo "  ✅ Decrypted firmware matches original (${DECRYPTED_SIZE} bytes)"
 
-# Step 8: Test metadata extraction
-echo "Step 8: Testing metadata extraction..."
+# Step 8: Test metadata extraction (including operational fields)
+echo "Step 8: Testing device metadata extraction..."
 METADATA=$(${BUILD_DIR}/client/sum-inspect --cert update.crt --json)
 echo "$METADATA" | grep -q "DEVICE-TEST-12345" || { echo "  ❌ Wrong hardware_id"; exit 1; }
 echo "$METADATA" | grep -q "Integration Test Corp" || { echo "  ❌ Wrong manufacturer"; exit 1; }
 echo "$METADATA" | grep -q "TestDevice" || { echo "  ❌ Wrong device_type"; exit 1; }
-echo "  ✅ Device metadata extraction successful"
+echo "  ✅ Basic device metadata extraction successful"
+
+echo "Step 8b: Verifying operational metadata fields..."
+# Verify manifest_version is present and correct
+echo "$METADATA" | grep -q "Manifest Version:.*1" || { echo "  ❌ Wrong manifest_version"; exit 1; }
+
+# Verify manifest_type is FULL
+echo "$METADATA" | grep -q "Manifest Type:.*FULL" || { echo "  ❌ Wrong manifest_type"; exit 1; }
+
+# Verify provides array contains artifact info
+echo "$METADATA" | grep -q "Provides.*1 artifact" || { echo "  ❌ Missing provides array"; exit 1; }
+echo "$METADATA" | grep -q "firmware@primary" || { echo "  ❌ Wrong artifact in provides"; exit 1; }
+echo "$METADATA" | grep -q "Security Version: 42" || { echo "  ❌ Wrong security version in provides"; exit 1; }
+echo "$METADATA" | grep -q "Version: 1.0.0" || { echo "  ❌ Wrong version in provides"; exit 1; }
+
+echo "  ✅ Operational metadata fields verified (manifest_version, manifest_type, provides)"
 
 # Step 9: Test wrong device key
 echo "Step 9: Testing wrong device key rejection..."

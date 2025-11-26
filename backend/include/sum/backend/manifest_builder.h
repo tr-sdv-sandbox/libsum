@@ -119,9 +119,13 @@ public:
 
         /**
          * @brief Add download source
-         * @param uri Download URI (http://, https://, s3://, ipfs://, file://)
+         * @param uri Download URI (http://, https://, s3://, ipfs://, file://, ca://)
          * @param priority 0 = highest priority (try first), 1 = fallback, etc.
-         * @param type Optional hint: "http", "s3", "ipfs", "file"
+         * @param type Source type determines fetch method:
+         *             "http"/"https" - Fetch from URI
+         *             "ipfs" - Use ciphertext_hash as IPFS CID
+         *             "ca" - Lookup in local cache by ciphertext_hash
+         *             "bittorrent" - Use ciphertext_hash as infohash
          */
         ArtifactBuilder& AddSource(
             const std::string& uri,
@@ -130,10 +134,16 @@ public:
         );
 
         /**
-         * @brief Enable content-addressable storage
-         * @param enabled If true, device can auto-discover by ciphertext_hash
+         * @brief Set artifact version (feature version)
+         * @param version Semantic version
          */
-        ArtifactBuilder& SetContentAddressable(bool enabled = true);
+        ArtifactBuilder& SetVersion(const SemVer& version);
+
+        /**
+         * @brief Set security version (rollback protection)
+         * @param security_version Monotonic counter for security updates
+         */
+        ArtifactBuilder& SetSecurityVersion(uint64_t security_version);
 
         /**
          * @brief Return to parent builder
@@ -151,7 +161,8 @@ public:
         std::string target_ecu_;
         uint32_t install_order_ = 0;
         std::vector<Source> sources_;
-        bool content_addressable_ = false;
+        SemVer version_;
+        uint64_t security_version_ = 0;
     };
 
     /**
@@ -182,16 +193,10 @@ public:
     );
 
     /**
-     * @brief Set manifest version (user-controlled, for display)
-     * @param version Software version number
+     * @brief Set manifest version (metadata sequence number)
+     * @param version Manifest version (monotonic, for ordering and replay protection)
      */
     ManifestBuilder& SetManifestVersion(uint64_t version);
-
-    /**
-     * @brief Set release counter (monotonic, rollback protection)
-     * @param counter Release counter (MUST increment, CANNOT skip)
-     */
-    ManifestBuilder& SetReleaseCounter(uint64_t counter);
 
     /**
      * @brief Add metadata key-value pair
@@ -207,13 +212,13 @@ public:
      *
      * @param device_id Device identifier (for per-device encryption tracking)
      * @param device_pubkey Device's X25519 public key for key wrapping
-     * @param version Manifest version (also used as release_counter if not set)
+     * @param manifest_version Metadata sequence number (monotonic, for ordering/replay protection)
      * @return Pair of (manifest, map of artifact_name -> encrypted_data)
      */
     std::pair<Manifest, std::map<std::string, std::vector<uint8_t>>> Build(
         const std::string& device_id,
         const crypto::PublicKey& device_pubkey,
-        uint64_t version
+        uint64_t manifest_version
     );
 
     /**
@@ -224,30 +229,14 @@ public:
      *
      * @param device_pubkey Device's public key for certificate subject and key wrapping
      * @param device_metadata Device identification (hardware_id is REQUIRED)
-     * @param version Manifest version (DEPRECATED - use SemVer overload)
+     * @param manifest_version Metadata sequence number (monotonic, for ordering/replay protection)
      * @param validity_days Certificate validity in days
      * @return Pair of (certificate, map of artifact_name -> encrypted_data)
      */
     std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>> BuildCertificate(
         const crypto::PublicKey& device_pubkey,
         const DeviceMetadata& device_metadata,
-        uint64_t version,
-        int validity_days = 90
-    );
-
-    /**
-     * @brief Build and package manifest into X.509 certificate with semantic versioning
-     *
-     * @param device_pubkey Device's public key for certificate subject and key wrapping
-     * @param device_metadata Device identification (hardware_id is REQUIRED)
-     * @param sw_version Semantic software version
-     * @param validity_days Certificate validity in days
-     * @return Pair of (certificate, map of artifact_name -> encrypted_data)
-     */
-    std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>> BuildCertificate(
-        const crypto::PublicKey& device_pubkey,
-        const DeviceMetadata& device_metadata,
-        const SemVer& sw_version,
+        uint64_t manifest_version,
         int validity_days = 90
     );
 
@@ -259,30 +248,14 @@ public:
      *
      * @param device_pubkey Device's public key for certificate subject and key wrapping
      * @param device_metadata Device identification (hardware_id is REQUIRED)
-     * @param version Manifest version (DEPRECATED - use SemVer overload)
+     * @param manifest_version Metadata sequence number (monotonic, for ordering/replay protection)
      * @param validity_days Certificate validity in days
      * @return Pair of (PEM bundle, map of artifact_name -> encrypted_data)
      */
     std::pair<std::string, std::map<std::string, std::vector<uint8_t>>> BuildCertificateChainPEM(
         const crypto::PublicKey& device_pubkey,
         const DeviceMetadata& device_metadata,
-        uint64_t version,
-        int validity_days = 90
-    );
-
-    /**
-     * @brief Build and package into PEM certificate chain with semantic versioning
-     *
-     * @param device_pubkey Device's public key for certificate subject and key wrapping
-     * @param device_metadata Device identification (hardware_id is REQUIRED)
-     * @param sw_version Semantic software version
-     * @param validity_days Certificate validity in days
-     * @return Pair of (PEM bundle, map of artifact_name -> encrypted_data)
-     */
-    std::pair<std::string, std::map<std::string, std::vector<uint8_t>>> BuildCertificateChainPEM(
-        const crypto::PublicKey& device_pubkey,
-        const DeviceMetadata& device_metadata,
-        const SemVer& sw_version,
+        uint64_t manifest_version,
         int validity_days = 90
     );
 

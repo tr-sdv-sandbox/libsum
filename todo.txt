@@ -1,0 +1,3 @@
+software removal support
+device metadata - should that include full / partial and manifest version, and how would a workshop that cannot decrypt the full manifest know if a device can be jumped to a full version=?
+

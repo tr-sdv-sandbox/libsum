@@ -14,10 +14,8 @@ namespace sum {
 
 class ManifestValidator::Impl {
 public:
-    crypto::Certificate backend_ca;
+    crypto::Certificate backend_ca;  // Root CA (trust anchor)
     crypto::PrivateKey device_key;
-    std::vector<crypto::Certificate> intermediates;
-    bool use_chain = false;
 
     // Security policies
     uint64_t last_installed_version = 0;  // Anti-rollback/replay protection
@@ -25,32 +23,13 @@ public:
 
     Impl(const crypto::Certificate& ca, const crypto::PrivateKey& key)
         : backend_ca(crypto::Certificate::LoadFromDER(ca.ToDER()))
-        , device_key(crypto::PrivateKey::LoadFromPEM(key.ToPEM()))
-        , use_chain(false) {}
-
-    Impl(const crypto::Certificate& root,
-         const std::vector<crypto::Certificate>& intermediate_certs,
-         const crypto::PrivateKey& key)
-        : backend_ca(crypto::Certificate::LoadFromDER(root.ToDER()))
-        , device_key(crypto::PrivateKey::LoadFromPEM(key.ToPEM()))
-        , use_chain(true) {
-        // Clone intermediate certificates via DER roundtrip
-        for (const auto& cert : intermediate_certs) {
-            intermediates.push_back(crypto::Certificate::LoadFromDER(cert.ToDER()));
-        }
-    }
+        , device_key(crypto::PrivateKey::LoadFromPEM(key.ToPEM())) {}
 };
 
 ManifestValidator::ManifestValidator(
-    const crypto::Certificate& backend_ca,
-    const crypto::PrivateKey& device_key
-) : impl_(std::make_unique<Impl>(backend_ca, device_key)) {}
-
-ManifestValidator::ManifestValidator(
     const crypto::Certificate& root_ca,
-    const std::vector<crypto::Certificate>& intermediates,
     const crypto::PrivateKey& device_key
-) : impl_(std::make_unique<Impl>(root_ca, intermediates, device_key)) {}
+) : impl_(std::make_unique<Impl>(root_ca, device_key)) {}
 
 ManifestValidator::~ManifestValidator() = default;
 
@@ -102,34 +81,31 @@ Manifest ManifestValidator::ValidateCertificate(
 ) {
     std::vector<uint8_t> manifest_data;
 
-    // Step 1: Check certificate revocation (timestamp-based)
-    // SECURITY: Check intermediate certificates BEFORE validation
-    // This prevents wasting CPU on revoked cert chain validation
-    if (impl_->use_chain && impl_->reject_certs_before > 0) {
-        for (const auto& intermediate : impl_->intermediates) {
-            int64_t cert_not_before = intermediate.GetNotBefore();
-            if (cert_not_before < impl_->reject_certs_before) {
+    // Step 1: Check intermediate certificate revocation (timestamp-based)
+    // SECURITY: Check BEFORE validation to avoid wasting CPU on revoked certs
+    if (impl_->reject_certs_before > 0) {
+        try {
+            int64_t intermediate_issuance = certificate.GetIntermediateIssuanceTime();
+            if (intermediate_issuance < impl_->reject_certs_before) {
                 throw crypto::CryptoError(
-                    "Certificate revoked: issued at " + std::to_string(cert_not_before) +
+                    "Intermediate certificate revoked: issued at " + std::to_string(intermediate_issuance) +
                     " which is before revocation timestamp " + std::to_string(impl_->reject_certs_before)
                 );
             }
+        } catch (const crypto::CryptoError& e) {
+            std::string msg = e.what();
+            // Re-throw if this is the revocation error
+            if (msg.find("revoked") != std::string::npos) {
+                throw;
+            }
+            // Otherwise, it's "No intermediate certificate embedded" or "Expected exactly 1"
+            // GetVerifiedManifest will handle validation (cert is likely invalid anyway)
         }
     }
 
-    // Step 2: Verify certificate signature and extract verified manifest
-    // Both paths verify against root CA - difference is chain length
-    if (impl_->use_chain) {
-        // Validate chain: update cert → intermediate(s) → root CA
-        manifest_data = certificate.GetVerifiedManifestWithChain(
-            impl_->intermediates,
-            impl_->backend_ca,  // root CA
-            trusted_time
-        );
-    } else {
-        // Validate directly: update cert → root CA (no intermediates)
-        manifest_data = certificate.GetVerifiedManifest(impl_->backend_ca, trusted_time);
-    }
+    // Step 2: Verify certificate chain and extract verified manifest
+    // Certificate uses internally stored intermediates from PEM bundle
+    manifest_data = certificate.GetVerifiedManifest(impl_->backend_ca, trusted_time);
 
     // Step 3: Parse manifest from verified protobuf
     auto manifest = Manifest::LoadFromProtobuf(manifest_data);

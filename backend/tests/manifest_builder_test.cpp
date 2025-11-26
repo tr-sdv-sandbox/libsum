@@ -325,3 +325,120 @@ TEST_F(ManifestBuilderTest, SetManifestMetadata) {
     EXPECT_EQ(manifest.GetMetadata("vendor").value(), "TestVendor");
     EXPECT_EQ(manifest.GetMetadata("release_notes").value(), "Bug fixes");
 }
+
+// ============================================================================
+// Device Metadata Tests (Operational Fields)
+// ============================================================================
+
+TEST_F(ManifestBuilderTest, DeviceMetadataContainsOperationalFields) {
+    // Create multi-artifact update with versions
+    std::vector<uint8_t> bootloader(512, 0xBB);
+    std::vector<uint8_t> firmware(1024, 0xFF);
+
+    auto encrypted_bootloader = EncryptSoftware(bootloader);
+    auto encrypted_firmware = EncryptSoftware(firmware);
+
+    ManifestBuilder builder(intermediate_key_, intermediate_cert_);
+
+    builder.AddArtifact("bootloader", encrypted_bootloader)
+        .SetType("bootloader")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{1, 0, 0, "", ""})
+        .SetSecurityVersion(5)
+        .SetInstallOrder(0);
+
+    builder.AddArtifact("firmware", encrypted_firmware)
+        .SetType("firmware")
+        .SetTargetECU("primary")
+        .SetVersion(SemVer{2, 3, 1, "beta", "git.abc123"})
+        .SetSecurityVersion(15)
+        .SetInstallOrder(1);
+
+    // Build certificate with manifest_version=42
+    auto [cert, encrypted_files] = builder.BuildCertificate(
+        device_pubkey_, device_metadata_, 42, 365
+    );
+
+    // Verify device metadata has operational fields
+    EXPECT_TRUE(cert.HasDeviceMetadata());
+    auto metadata = cert.GetDeviceMetadata(root_cert_, time(nullptr));
+
+    // Basic device info
+    EXPECT_EQ(metadata.hardware_id, "TEST-DEVICE-001");
+    EXPECT_EQ(metadata.manufacturer, "Test Manufacturer");
+    EXPECT_EQ(metadata.device_type, "Test-Device");
+    EXPECT_EQ(metadata.hardware_version, "v1.0");
+
+    // Operational metadata
+    EXPECT_EQ(metadata.manifest_version, 42);
+    EXPECT_EQ(metadata.manifest_type, ManifestType::FULL);
+
+    // Verify provides array matches artifacts
+    ASSERT_EQ(metadata.provides.size(), 2);
+
+    // Check bootloader
+    const auto& bootloader_info = metadata.provides[0];
+    EXPECT_EQ(bootloader_info.name, "bootloader");
+    EXPECT_EQ(bootloader_info.type, "bootloader");
+    EXPECT_EQ(bootloader_info.target_ecu, "primary");
+    EXPECT_EQ(bootloader_info.security_version, 5);
+    EXPECT_EQ(bootloader_info.version.major, 1);
+    EXPECT_EQ(bootloader_info.version.minor, 0);
+    EXPECT_EQ(bootloader_info.version.patch, 0);
+
+    // Check firmware
+    const auto& firmware_info = metadata.provides[1];
+    EXPECT_EQ(firmware_info.name, "firmware");
+    EXPECT_EQ(firmware_info.type, "firmware");
+    EXPECT_EQ(firmware_info.target_ecu, "primary");
+    EXPECT_EQ(firmware_info.security_version, 15);
+    EXPECT_EQ(firmware_info.version.major, 2);
+    EXPECT_EQ(firmware_info.version.minor, 3);
+    EXPECT_EQ(firmware_info.version.patch, 1);
+    EXPECT_EQ(firmware_info.version.prerelease, "beta");
+    EXPECT_EQ(firmware_info.version.build_metadata, "git.abc123");
+
+    // Verify requires is empty (no constraints implemented yet)
+    EXPECT_TRUE(metadata.requires.empty());
+}
+
+TEST_F(ManifestBuilderTest, DeviceMetadataRoundTripThroughProtobuf) {
+    std::vector<uint8_t> firmware(256, 0xAA);
+    auto encrypted = EncryptSoftware(firmware);
+
+    ManifestBuilder builder(intermediate_key_, intermediate_cert_);
+
+    builder.AddArtifact("app", encrypted)
+        .SetType("application")
+        .SetTargetECU("secondary")
+        .SetVersion(SemVer{3, 2, 1, "", ""})
+        .SetSecurityVersion(20);
+
+    auto [cert, encrypted_files] = builder.BuildCertificate(
+        device_pubkey_, device_metadata_, 100, 365
+    );
+
+    // Extract device metadata
+    auto metadata = cert.GetDeviceMetadata(root_cert_, time(nullptr));
+
+    // Serialize to protobuf
+    auto protobuf_data = metadata.ToProtobuf();
+    EXPECT_FALSE(protobuf_data.empty());
+
+    // Deserialize back
+    auto metadata2 = DeviceMetadata::FromProtobuf(protobuf_data);
+
+    // Verify round-trip preserves all fields
+    EXPECT_EQ(metadata2.hardware_id, metadata.hardware_id);
+    EXPECT_EQ(metadata2.manufacturer, metadata.manufacturer);
+    EXPECT_EQ(metadata2.device_type, metadata.device_type);
+    EXPECT_EQ(metadata2.hardware_version, metadata.hardware_version);
+    EXPECT_EQ(metadata2.manifest_version, metadata.manifest_version);
+    EXPECT_EQ(metadata2.manifest_type, metadata.manifest_type);
+    EXPECT_EQ(metadata2.provides.size(), metadata.provides.size());
+
+    if (!metadata2.provides.empty()) {
+        EXPECT_EQ(metadata2.provides[0].name, metadata.provides[0].name);
+        EXPECT_EQ(metadata2.provides[0].security_version, metadata.provides[0].security_version);
+    }
+}

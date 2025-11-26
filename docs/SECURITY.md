@@ -72,6 +72,10 @@ The PEM bundle format follows standard PKI practice (like TLS certificates), all
 │  - manufacturer                         │
 │  - device_type                          │
 │  - hardware_version (optional)          │
+│  - manifest_version (ordering)          │
+│  - manifest_type (FULL/DELTA)           │
+│  - provides (what update installs)      │
+│  - requires (device prerequisites)      │
 │  ⚠️  UNVERIFIED - for filtering only    │
 ├─────────────────────────────────────────┤
 │  Custom Extension #2 (CRITICAL):        │
@@ -100,7 +104,11 @@ The PEM bundle format follows standard PKI practice (like TLS certificates), all
 2. Create Device Metadata
    ├─ hardware_id: CRITICAL - links to device public key in database
    ├─ manufacturer, device_type: for quick filtering
-   └─ hardware_version (optional)
+   ├─ hardware_version (optional)
+   ├─ manifest_version: for ordering updates
+   ├─ manifest_type: FULL or DELTA
+   ├─ provides: what artifacts this update installs (operational metadata)
+   └─ requires: device prerequisites for this update (operational metadata)
 
 3. CreateCertificateWithManifest()
    ├─ Embed manifest as X.509 extension

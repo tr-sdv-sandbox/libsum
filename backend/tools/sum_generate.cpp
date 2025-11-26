@@ -8,7 +8,7 @@
 
 #include "sum/common/crypto.h"
 #include "sum/common/manifest.h"
-#include "sum/backend/generator.h"
+#include "sum/backend/manifest_builder.h"
 #include <glog/logging.h>
 #include <iostream>
 #include <fstream>
@@ -31,16 +31,23 @@ void PrintUsage(const char* program_name) {
               << "  --hardware-id ID          Device hardware ID (REQUIRED - links to device public key)\n"
               << "  --manufacturer NAME       Device manufacturer\n"
               << "  --device-type TYPE        Device type/model\n"
+              << "  --artifact-name NAME      Artifact identifier (e.g., \"bootloader\", \"firmware\")\n"
+              << "  --artifact-type TYPE      Artifact type (e.g., \"firmware\", \"bootloader\", \"filesystem\")\n"
+              << "  --target-ecu ECU          Target ECU (e.g., \"primary\", \"secondary\", \"wifi-coprocessor\")\n"
               << "  --output FILE             Output certificate file (.crt)\n"
               << "  --encrypted-output FILE   Output encrypted software\n"
               << "\n"
-              << "Version Options (at least one required):\n"
-              << "  --sw-version VERSION      Semantic version (e.g., \"1.2.3\" or \"1.2.3-beta.1+git.abc\")\n"
-              << "  --version VERSION         Simple version number (DEPRECATED, use --sw-version)\n"
+              << "Version Options:\n"
+              << "  --sw-version VERSION          Semantic version (e.g., \"1.2.3\" or \"1.2.3-beta.1+git.abc\") [required]\n"
+              << "                                Feature version for compatibility\n"
+              << "  --sw-security-version NUM     Security version (monotonic counter, per-artifact, default: 0)\n"
+              << "                                Used for rollback protection (must increase with security patches)\n"
+              << "  --manifest-version NUM        Manifest version (monotonic counter, per-manifest) [required]\n"
+              << "                                Used for replay protection (must increase per manifest)\n"
               << "\n"
               << "Optional:\n"
               << "  --hardware-version VER    Hardware version (optional)\n"
-              << "  --no-encryption           Do not encrypt software\n"
+              << "  --artifact-url URL        Artifact download URL (optional)\n"
               << "  --validity-days DAYS      Certificate validity in days (default: 90)\n"
               << "  --help                    Show this help message\n"
               << "\n"
@@ -54,7 +61,12 @@ void PrintUsage(const char* program_name) {
               << "    --manufacturer \"Acme Corp\" \\\n"
               << "    --device-type \"ESP32-Gateway\" \\\n"
               << "    --hardware-version \"v2.1\" \\\n"
+              << "    --artifact-name firmware \\\n"
+              << "    --artifact-type firmware \\\n"
+              << "    --target-ecu primary \\\n"
               << "    --sw-version \"1.2.3-rc.1+git.abc123\" \\\n"
+              << "    --sw-security-version 42 \\\n"
+              << "    --manifest-version 1 \\\n"
               << "    --output update.crt \\\n"
               << "    --encrypted-output firmware.enc\n"
               << std::endl;
@@ -143,12 +155,15 @@ int main(int argc, char* argv[]) {
     std::string manufacturer;
     std::string device_type;
     std::string hardware_version;
+    std::string artifact_name;
+    std::string artifact_type;
+    std::string target_ecu;
     std::string artifact_url;  // Optional artifact URL for manifest
-    uint64_t version = 0;
     std::string sw_version_str;  // Semantic version string
+    uint64_t sw_security_version = 0;
+    uint64_t manifest_version = 0;
     std::string output_file;
     std::string encrypted_output_file;
-    bool use_encryption = true;
     int validity_days = 90;
 
     // Parse arguments
@@ -172,20 +187,26 @@ int main(int argc, char* argv[]) {
             device_type = argv[++i];
         } else if (strcmp(argv[i], "--hardware-version") == 0 && i + 1 < argc) {
             hardware_version = argv[++i];
+        } else if (strcmp(argv[i], "--artifact-name") == 0 && i + 1 < argc) {
+            artifact_name = argv[++i];
+        } else if (strcmp(argv[i], "--artifact-type") == 0 && i + 1 < argc) {
+            artifact_type = argv[++i];
+        } else if (strcmp(argv[i], "--target-ecu") == 0 && i + 1 < argc) {
+            target_ecu = argv[++i];
         } else if (strcmp(argv[i], "--artifact-url") == 0 && i + 1 < argc) {
             artifact_url = argv[++i];
         } else if (strcmp(argv[i], "--sw-version") == 0 && i + 1 < argc) {
             sw_version_str = argv[++i];
-        } else if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
-            version = std::stoull(argv[++i]);
+        } else if (strcmp(argv[i], "--sw-security-version") == 0 && i + 1 < argc) {
+            sw_security_version = std::stoull(argv[++i]);
+        } else if (strcmp(argv[i], "--manifest-version") == 0 && i + 1 < argc) {
+            manifest_version = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--encrypted-output") == 0 && i + 1 < argc) {
             encrypted_output_file = argv[++i];
         } else if (strcmp(argv[i], "--validity-days") == 0 && i + 1 < argc) {
             validity_days = std::stoi(argv[++i]);
-        } else if (strcmp(argv[i], "--no-encryption") == 0) {
-            use_encryption = false;
         } else {
             LOG(ERROR) << "Unknown argument: " << argv[i];
             PrintUsage(argv[0]);
@@ -197,21 +218,21 @@ int main(int argc, char* argv[]) {
     if (software_file.empty() || device_pubkey_file.empty() ||
         backend_key_file.empty() || backend_cert_file.empty() ||
         hardware_id.empty() || manufacturer.empty() || device_type.empty() ||
-        output_file.empty()) {
+        artifact_name.empty() || artifact_type.empty() || target_ecu.empty() ||
+        output_file.empty() || encrypted_output_file.empty()) {
         LOG(ERROR) << "Missing required arguments";
         PrintUsage(argv[0]);
         return 1;
     }
 
-    if (use_encryption && encrypted_output_file.empty()) {
-        LOG(ERROR) << "--encrypted-output required when encryption is enabled";
+    // Validate version arguments
+    if (sw_version_str.empty()) {
+        LOG(ERROR) << "Missing required argument: --sw-version";
         PrintUsage(argv[0]);
         return 1;
     }
-
-    // Validate version (at least one required)
-    if (sw_version_str.empty() && version == 0) {
-        LOG(ERROR) << "Either --sw-version or --version required";
+    if (manifest_version == 0) {
+        LOG(ERROR) << "Missing required argument: --manifest-version (must be > 0)";
         PrintUsage(argv[0]);
         return 1;
     }
@@ -230,9 +251,6 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "Loading backend CA certificate from: " << backend_cert_file;
         auto backend_cert = sum::crypto::Certificate::LoadFromFile(backend_cert_file);
 
-        LOG(INFO) << "Creating manifest generator";
-        sum::ManifestGenerator generator(backend_key, backend_cert);
-
         // Create device metadata
         sum::DeviceMetadata device_metadata;
         device_metadata.hardware_id = hardware_id;
@@ -247,32 +265,39 @@ int main(int argc, char* argv[]) {
         if (!hardware_version.empty()) {
             LOG(INFO) << "  Hardware Version: " << hardware_version;
         }
-        LOG(INFO) << "  Encryption: " << (use_encryption ? "enabled" : "disabled");
         LOG(INFO) << "  Validity: " << validity_days << " days";
 
-        std::string pem_chain;
-        std::vector<uint8_t> output_software;
+        // Encrypt software once
+        LOG(INFO) << "Encrypting software";
+        auto encrypted = sum::EncryptSoftware(software);
 
-        if (!sw_version_str.empty()) {
-            // Use semantic version (preferred)
-            auto sw_version = ParseSemVer(sw_version_str);
-            LOG(INFO) << "  Software Version: " << sw_version.ToString();
+        // Create manifest builder
+        sum::ManifestBuilder builder(backend_key, backend_cert);
 
-            auto result = generator.CreateCertificateChainPEM(
-                software, device_pubkey, device_metadata, sw_version, use_encryption, validity_days, artifact_url
-            );
-            pem_chain = std::move(result.first);
-            output_software = std::move(result.second);
-        } else {
-            // Use old version number (deprecated path)
-            LOG(INFO) << "  Software Version: " << version << " (DEPRECATED: use --sw-version)";
+        // Add artifact with versions
+        auto sw_version = ParseSemVer(sw_version_str);
+        LOG(INFO) << "  Software Version: " << sw_version.ToString();
+        LOG(INFO) << "  Software Security Version: " << sw_security_version;
+        LOG(INFO) << "  Manifest Version: " << manifest_version;
 
-            auto result = generator.CreateCertificateChainPEM(
-                software, device_pubkey, device_metadata, version, use_encryption, validity_days, artifact_url
-            );
-            pem_chain = std::move(result.first);
-            output_software = std::move(result.second);
+        auto& artifact_builder = builder.AddArtifact(artifact_name, encrypted)
+            .SetType(artifact_type)
+            .SetTargetECU(target_ecu)
+            .SetVersion(sw_version)
+            .SetSecurityVersion(sw_security_version);
+
+        // Add artifact URL if provided
+        if (!artifact_url.empty()) {
+            artifact_builder.AddSource(artifact_url, 0);
         }
+
+        // Build certificate
+        auto [pem_chain, encrypted_files] = builder.BuildCertificateChainPEM(
+            device_pubkey, device_metadata, manifest_version, validity_days
+        );
+
+        // Extract encrypted software
+        auto encrypted_software = encrypted_files.at(artifact_name);
 
         LOG(INFO) << "Writing certificate chain (PEM bundle) to: " << output_file;
         std::ofstream pem_file(output_file);
@@ -282,19 +307,15 @@ int main(int argc, char* argv[]) {
         pem_file << pem_chain;
         pem_file.close();
 
-        if (use_encryption) {
-            LOG(INFO) << "Writing encrypted software to: " << encrypted_output_file;
-            WriteFile(encrypted_output_file, output_software);
-        }
+        LOG(INFO) << "Writing encrypted software to: " << encrypted_output_file;
+        WriteFile(encrypted_output_file, encrypted_software);
 
         LOG(INFO) << "✅ Certificate chain generation complete";
         LOG(INFO) << "Distribution format: PEM certificate bundle (.crt)";
         LOG(INFO) << "Certificate chain file: " << output_file;
         LOG(INFO) << "  Contains: Update certificate + Intermediate CA certificate";
-        if (use_encryption) {
-            LOG(INFO) << "Encrypted software: " << encrypted_output_file;
-            LOG(INFO) << "Encrypted size: " << output_software.size() << " bytes";
-        }
+        LOG(INFO) << "Encrypted software: " << encrypted_output_file;
+        LOG(INFO) << "Encrypted size: " << encrypted_software.size() << " bytes";
         LOG(INFO) << "";
         LOG(INFO) << "Distribution: " << output_file << " + " << encrypted_output_file << " + ca.crt (root)";
 

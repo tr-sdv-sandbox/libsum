@@ -22,34 +22,18 @@ namespace sum {
 class ManifestValidator {
 public:
     /**
-     * @brief Create validator with root CA and device private key (simple PKI)
+     * @brief Create validator with root CA and device private key
      *
-     * This constructor is for simple PKI without intermediate CAs.
-     * Update certificates are signed directly by the root CA.
+     * Validates update certificates against the trusted root CA.
+     * Update certificates loaded from PEM bundles internally contain intermediate certificates.
      *
-     * For production deployments, use the constructor with intermediate CAs instead.
+     * Certificate chain verification: update cert (with embedded intermediates) → root CA
      *
-     * @param backend_ca Trusted root CA certificate (trust anchor)
+     * @param root_ca Trusted root CA certificate (trust anchor)
      * @param device_key Device's private key (X25519) for key unwrapping
      */
     ManifestValidator(
-        const crypto::Certificate& backend_ca,
-        const crypto::PrivateKey& device_key
-    );
-
-    /**
-     * @brief Create validator with certificate chain (root + intermediates)
-     *
-     * This constructor is for production PKI hierarchies with intermediate CAs.
-     * The certificate chain verification follows: update cert → intermediates → root_ca
-     *
-     * @param root_ca Trusted root CA certificate (trust anchor, kept offline)
-     * @param intermediates Vector of intermediate CA certificates (ordered leaf to root)
-     * @param device_key Device's private key for key unwrapping
-     */
-    ManifestValidator(
         const crypto::Certificate& root_ca,
-        const std::vector<crypto::Certificate>& intermediates,
         const crypto::PrivateKey& device_key
     );
 
@@ -81,14 +65,14 @@ public:
     /**
      * @brief Reject certificates issued before timestamp (emergency revocation)
      *
-     * Once set, ValidateCertificate() will reject any intermediate certificate
-     * with notBefore < reject_timestamp. This provides emergency revocation
-     * without CRL/OCSP infrastructure.
+     * Once set, ValidateCertificate() will reject any update certificate whose
+     * embedded intermediate was issued before the reject timestamp. This provides
+     * emergency revocation without CRL/OCSP infrastructure.
      *
      * When an intermediate CA is compromised:
      * 1. Backend issues new intermediate CA with notBefore = now
      * 2. Backend sends emergency update with reject_timestamp = now
-     * 3. Devices reject all certs issued before compromise
+     * 3. Devices reject all certificates with old intermediate
      *
      * Typical usage:
      * @code

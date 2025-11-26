@@ -72,9 +72,13 @@ struct Source {
 struct SoftwareArtifact {
     // Identification
     std::string name;                      ///< Unique identifier (e.g., "bootloader", "application")
-    std::string type;                      ///< NEW: Artifact type ("firmware", "bootloader", "filesystem", "container", etc.)
-    std::string target_ecu;                ///< NEW: Target component ("primary", "wifi-coprocessor", etc.)
-    uint32_t install_order;                ///< NEW: Installation order (0 = first, 1 = second, etc.)
+    std::string type;                      ///< Artifact type ("firmware", "bootloader", "filesystem", "container", etc.)
+    std::string target_ecu;                ///< Target component ("primary", "wifi-coprocessor", etc.)
+    uint32_t install_order;                ///< Installation order (0 = first, 1 = second, etc.)
+
+    // Versioning
+    SemVer version;                        ///< Feature version (semantic, can skip/go backwards)
+    uint64_t security_version;             ///< Security version (monotonic per artifact, Uptane releaseCounter)
 
     // Plaintext verification (after decryption)
     std::string hash_algorithm;            ///< "SHA-256" (only supported algorithm)
@@ -82,16 +86,15 @@ struct SoftwareArtifact {
     uint64_t size;                         ///< Size of plaintext in bytes
 
     // Ciphertext verification (for download)
-    std::vector<uint8_t> ciphertext_hash;  ///< NEW: SHA-256 of encrypted file (for content-addressable storage)
-    uint64_t ciphertext_size;              ///< NEW: Size of encrypted file (for download progress)
+    std::vector<uint8_t> ciphertext_hash;  ///< SHA-256 of encrypted file (for content-addressable storage)
+    uint64_t ciphertext_size;              ///< Size of encrypted file (for download progress)
 
     // Signature
     std::string signature_algorithm;       ///< "Ed25519" (only supported algorithm)
     std::vector<uint8_t> signature;        ///< Ed25519 signature over expected_hash (64 bytes)
 
     // Source discovery
-    std::vector<Source> sources;           ///< Download sources (try in priority order)
-    bool content_addressable;              ///< If true, can auto-discover by ciphertext_hash
+    std::vector<Source> sources;           ///< Download sources (try in priority order, type determines fetch method)
 };
 
 /**
@@ -180,42 +183,21 @@ public:
     // Accessors
 
     /**
-     * @brief Get manifest format version (schema version)
+     * @brief Get manifest schema version (protocol version)
      * @return Format version (currently always 1)
      */
     uint32_t GetVersion() const;
 
     /**
-     * @brief Get software/update version number
+     * @brief Get metadata sequence number (ordering, replay protection)
      *
-     * User-controlled version that can skip numbers (for display purposes).
-     * For rollback protection, use GetReleaseCounter().
+     * Monotonic counter tracking when manifest was issued (Uptane/TUF "version" field).
+     * Used for manifest ordering and replay attack prevention.
+     * MUST increment with each manifest (even A/B variants).
      *
-     * DEPRECATED: Use GetSoftwareVersion() for semantic versioning
-     *
-     * @return Software version number
+     * @return Metadata sequence number
      */
     uint64_t GetManifestVersion() const;
-
-    /**
-     * @brief Get semantic software version
-     *
-     * Returns the semantic version (major.minor.patch) of the software being installed.
-     * Provides better compatibility tracking than simple manifest_version.
-     *
-     * @return Semantic version, or nullopt if not set
-     */
-    std::optional<SemVer> GetSoftwareVersion() const;
-
-    /**
-     * @brief Get release counter (monotonic, rollback protection)
-     *
-     * This MUST increment with each update and CANNOT skip.
-     * Primary rollback protection mechanism (Uptane-inspired).
-     *
-     * @return Release counter
-     */
-    uint64_t GetReleaseCounter() const;
 
     /**
      * @brief Get manifest hash (snapshot protection)
@@ -261,8 +243,6 @@ public:
     // Mutators (for building manifests)
 
     void SetManifestVersion(uint64_t version);
-    void SetSoftwareVersion(const SemVer& version);
-    void SetReleaseCounter(uint64_t counter);
     void SetManifestHash(const std::vector<uint8_t>& hash);
     void AddArtifact(SoftwareArtifact artifact);
     void AddEncryptionParams(EncryptionParams params);
@@ -276,6 +256,41 @@ private:
 };
 
 /**
+ * @brief Manifest type (FULL vs DELTA update)
+ */
+enum class ManifestType {
+    FULL = 0,   ///< Complete system state - all artifacts device should have
+    DELTA = 1   ///< Partial update - only changed artifacts
+};
+
+/**
+ * @brief Artifact information (what an update provides)
+ *
+ * Duplicates key fields from SoftwareArtifact for unverified filtering.
+ * Used by workshop to see what will be installed without decryption.
+ */
+struct ArtifactInfo {
+    std::string name;              ///< Artifact identifier
+    std::string type;              ///< Artifact type
+    std::string target_ecu;        ///< Target ECU
+    uint64_t security_version;     ///< Security version this update provides
+    SemVer version;                ///< Feature version (optional, for display)
+};
+
+/**
+ * @brief Artifact constraint (what an update requires from device)
+ *
+ * Used by workshop to determine safe upgrade path without decryption.
+ */
+struct ArtifactConstraint {
+    std::string name;              ///< Artifact identifier
+    std::string type;              ///< Artifact type
+    std::string target_ecu;        ///< Target ECU
+    uint64_t min_security_version; ///< Minimum required on device (inclusive)
+    uint64_t max_security_version; ///< Maximum supported (inclusive, 0 = no limit)
+};
+
+/**
  * @brief Device metadata for X.509 certificate
  *
  * This metadata is embedded in the certificate and is readable without
@@ -284,12 +299,22 @@ private:
  *
  * The hardware_id is the critical field that links this update to a specific
  * device's public key in the backend database.
+ *
+ * SECURITY: This data is UNVERIFIED (readable without signature check).
+ * Used for filtering and operational decisions only.
+ * Device MUST use verified manifest data for security decisions.
  */
 struct DeviceMetadata {
     std::string hardware_id;       ///< REQUIRED: Unique device identifier (serial/UUID) - backend uses this to lookup device public key
     std::string manufacturer;      ///< Manufacturer name (e.g., "Acme Corp")
     std::string device_type;       ///< Device model/type (e.g., "ESP32-Gateway")
     std::string hardware_version;  ///< Hardware revision (e.g., "v2.1", optional)
+
+    // Operational metadata for workshop/filtering
+    uint64_t manifest_version;           ///< Manifest version (for ordering updates)
+    ManifestType manifest_type;          ///< FULL or DELTA
+    std::vector<ArtifactInfo> provides;  ///< What this update installs
+    std::vector<ArtifactConstraint> requires;  ///< Device state requirements
 
     /**
      * @brief Load device metadata from Protocol Buffer binary data

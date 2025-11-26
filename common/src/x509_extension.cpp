@@ -194,7 +194,27 @@ crypto::Certificate CreateCertificateWithManifest(
     std::vector<uint8_t> der_vec(der, der + len);
     OPENSSL_free(der);
 
-    return crypto::Certificate::LoadFromDER(der_vec);
+    auto result_cert = crypto::Certificate::LoadFromDER(der_vec);
+
+    // OPINIONATED: Automatically embed intermediate certificate for update certificates
+    // If issuer_cert is provided AND it's not self-signed (i.e., it's an intermediate CA, not root CA),
+    // then we're creating an update certificate and must embed the issuer as intermediate
+    if (issuer_cert != nullptr) {
+        X509* issuer_x509 = static_cast<X509*>(
+            const_cast<crypto::Certificate*>(issuer_cert)->GetNativeHandle()
+        );
+        X509_NAME* issuer_subject = X509_get_subject_name(issuer_x509);
+        X509_NAME* issuer_issuer = X509_get_issuer_name(issuer_x509);
+
+        // If issuer's subject != issuer's issuer, then issuer is not self-signed (it's an intermediate CA)
+        if (issuer_subject && issuer_issuer && X509_NAME_cmp(issuer_subject, issuer_issuer) != 0) {
+            // We're creating an update cert - embed the intermediate CA
+            result_cert.AddIntermediate(*issuer_cert);
+        }
+        // Otherwise, issuer is self-signed (root CA), so we're creating an intermediate CA - no embedding needed
+    }
+
+    return result_cert;
 }
 
 } // namespace sum

@@ -23,9 +23,7 @@ TEST(ManifestTest, CreateManifest) {
 }
 
 TEST(ManifestTest, SemanticVersion) {
-    Manifest manifest;
-
-    // Set semantic version
+    // Test semantic version on artifacts (not on manifest anymore)
     SemVer version;
     version.major = 1;
     version.minor = 2;
@@ -33,19 +31,40 @@ TEST(ManifestTest, SemanticVersion) {
     version.prerelease = "beta.1";
     version.build_metadata = "git.abc123";
 
-    manifest.SetSoftwareVersion(version);
+    // Create artifact with semantic version
+    SoftwareArtifact artifact;
+    artifact.name = "test-artifact";
+    artifact.type = "firmware";
+    artifact.target_ecu = "primary";
+    artifact.install_order = 0;
+    artifact.version = version;
+    artifact.security_version = 100;
+    artifact.hash_algorithm = "SHA-256";
+    artifact.expected_hash = {0xAA, 0xBB};
+    artifact.signature_algorithm = "Ed25519";
+    artifact.signature = {0x11, 0x22};
+    artifact.size = 1024;
+    artifact.ciphertext_size = 1100;
 
-    // Get semantic version
-    auto retrieved = manifest.GetSoftwareVersion();
-    ASSERT_TRUE(retrieved.has_value());
-    EXPECT_EQ(retrieved->major, 1);
-    EXPECT_EQ(retrieved->minor, 2);
-    EXPECT_EQ(retrieved->patch, 3);
-    EXPECT_EQ(retrieved->prerelease, "beta.1");
-    EXPECT_EQ(retrieved->build_metadata, "git.abc123");
+    // Add to manifest
+    Manifest manifest;
+    manifest.AddArtifact(artifact);
+
+    // Retrieve and verify
+    const auto& artifacts = manifest.GetArtifacts();
+    ASSERT_EQ(artifacts.size(), 1);
+    const auto& retrieved = artifacts[0].version;
+    EXPECT_EQ(retrieved.major, 1);
+    EXPECT_EQ(retrieved.minor, 2);
+    EXPECT_EQ(retrieved.patch, 3);
+    EXPECT_EQ(retrieved.prerelease, "beta.1");
+    EXPECT_EQ(retrieved.build_metadata, "git.abc123");
 
     // Test ToString
-    EXPECT_EQ(retrieved->ToString(), "1.2.3-beta.1+git.abc123");
+    EXPECT_EQ(retrieved.ToString(), "1.2.3-beta.1+git.abc123");
+
+    // Test security version
+    EXPECT_EQ(artifacts[0].security_version, 100);
 }
 
 TEST(ManifestTest, SemanticVersionComparison) {
@@ -253,7 +272,6 @@ TEST(ManifestParserTest, ParseComplexManifest) {
     // Create manifest with multiple artifacts and encryption params
     Manifest original;
     original.SetManifestVersion(42);
-    original.SetReleaseCounter(100);
 
     // Add multiple artifacts
     for (int i = 0; i < 3; i++) {
@@ -262,6 +280,13 @@ TEST(ManifestParserTest, ParseComplexManifest) {
         artifact.type = "firmware";
         artifact.target_ecu = "primary";
         artifact.install_order = i;
+
+        // Versioning
+        artifact.version.major = 1;
+        artifact.version.minor = i;
+        artifact.version.patch = 0;
+        artifact.security_version = 100 + i;
+
         artifact.hash_algorithm = "SHA-256";
         artifact.expected_hash = {0xAA, 0xBB, 0xCC, 0xDD};
         artifact.signature_algorithm = "Ed25519";
@@ -288,7 +313,6 @@ TEST(ManifestParserTest, ParseComplexManifest) {
 
     // Verify structure
     EXPECT_EQ(loaded.GetManifestVersion(), 42);
-    EXPECT_EQ(loaded.GetReleaseCounter(), 100);
     EXPECT_EQ(loaded.GetArtifacts().size(), 3);
     EXPECT_EQ(loaded.GetEncryptionParams().size(), 1);
 
@@ -297,6 +321,11 @@ TEST(ManifestParserTest, ParseComplexManifest) {
     for (size_t i = 0; i < artifacts.size(); i++) {
         EXPECT_EQ(artifacts[i].name, "artifact_" + std::to_string(i));
         EXPECT_EQ(artifacts[i].install_order, i);
+        // Verify versioning
+        EXPECT_EQ(artifacts[i].version.major, 1);
+        EXPECT_EQ(artifacts[i].version.minor, i);
+        EXPECT_EQ(artifacts[i].version.patch, 0);
+        EXPECT_EQ(artifacts[i].security_version, 100 + i);
         EXPECT_EQ(artifacts[i].size, 1024 * (i + 1));
     }
 
@@ -336,14 +365,13 @@ TEST(ManifestParserTest, ParseWithSources) {
     src3.type = "ipfs";
     artifact.sources.push_back(src3);
 
-    artifact.content_addressable = true;
     original.AddArtifact(artifact);
 
     // Serialize and deserialize
     auto data = original.ToProtobuf();
     Manifest loaded = Manifest::LoadFromProtobuf(data);
 
-    // Verify sources
+    // Verify sources (including content-addressable IPFS source)
     const auto& artifacts = loaded.GetArtifacts();
     ASSERT_EQ(artifacts.size(), 1);
     EXPECT_EQ(artifacts[0].sources.size(), 3);
@@ -351,8 +379,7 @@ TEST(ManifestParserTest, ParseWithSources) {
     EXPECT_EQ(artifacts[0].sources[0].priority, 0);
     EXPECT_EQ(artifacts[0].sources[1].priority, 1);
     EXPECT_EQ(artifacts[0].sources[2].priority, 2);
-    EXPECT_EQ(artifacts[0].sources[2].type, "ipfs");
-    EXPECT_TRUE(artifacts[0].content_addressable);
+    EXPECT_EQ(artifacts[0].sources[2].type, "ipfs");  // IPFS source implies content-addressable
 }
 
 // ============================================================================

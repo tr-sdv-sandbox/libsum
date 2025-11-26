@@ -135,22 +135,78 @@ void InspectX509Certificate(X509* x509, bool verbose) {
     }
 }
 
-void InspectDeviceMetadata(const sum::crypto::Certificate& cert) {
-    if (!cert.HasDeviceMetadata()) {
+void InspectDeviceMetadata(X509* x509) {
+    // Extract device metadata extension directly (OID 1.3.6.1.3.1)
+    ASN1_OBJECT* metadata_oid = OBJ_txt2obj(DEVICE_METADATA_OID, 1);
+    int ext_idx = X509_get_ext_by_OBJ(x509, metadata_oid, -1);
+    ASN1_OBJECT_free(metadata_oid);
+
+    if (ext_idx < 0) {
         std::cout << "\n⚠️  No device metadata extension found\n";
         return;
     }
 
-    std::cout << "\n=== Device Metadata ===\n\n";
+    X509_EXTENSION* ext = X509_get_ext(x509, ext_idx);
+    ASN1_OCTET_STRING* ext_data = X509_EXTENSION_get_data(ext);
+
+    std::vector<uint8_t> metadata_protobuf(
+        ASN1_STRING_get0_data(ext_data),
+        ASN1_STRING_get0_data(ext_data) + ASN1_STRING_length(ext_data)
+    );
+
+    std::cout << "\n=== Device Metadata (Unverified - raw extension data) ===\n\n";
 
     try {
-        auto metadata = cert.GetDeviceMetadata();
+        auto metadata = sum::DeviceMetadata::FromProtobuf(metadata_protobuf);
+
+        // Basic metadata
         std::cout << "Device Type:       " << metadata.device_type << "\n";
         std::cout << "Hardware ID:       " << metadata.hardware_id << "\n";
         std::cout << "Manufacturer:      " << metadata.manufacturer << "\n";
         if (!metadata.hardware_version.empty()) {
             std::cout << "Hardware Version:  " << metadata.hardware_version << "\n";
         }
+
+        // Operational metadata
+        std::cout << "\n--- Operational Metadata (for workshop filtering) ---\n\n";
+        std::cout << "Manifest Version:  " << metadata.manifest_version << "\n";
+        std::cout << "Manifest Type:     " << (metadata.manifest_type == sum::ManifestType::FULL ? "FULL" : "DELTA") << "\n";
+
+        // Provides (what this update installs)
+        if (!metadata.provides.empty()) {
+            std::cout << "\nProvides (" << metadata.provides.size() << " artifact" << (metadata.provides.size() > 1 ? "s" : "") << "):\n";
+            for (size_t i = 0; i < metadata.provides.size(); i++) {
+                const auto& artifact = metadata.provides[i];
+                std::cout << "  [" << (i+1) << "] " << artifact.name << "@" << artifact.target_ecu << "\n";
+                std::cout << "      Type: " << artifact.type << "\n";
+                std::cout << "      Version: " << artifact.version.ToString() << "\n";
+                std::cout << "      Security Version: " << artifact.security_version << "\n";
+            }
+        } else {
+            std::cout << "\nProvides: (none)\n";
+        }
+
+        // Requires (device state requirements)
+        if (!metadata.requires.empty()) {
+            std::cout << "\nRequires (" << metadata.requires.size() << " constraint" << (metadata.requires.size() > 1 ? "s" : "") << "):\n";
+            for (size_t i = 0; i < metadata.requires.size(); i++) {
+                const auto& constraint = metadata.requires[i];
+                std::cout << "  [" << (i+1) << "] " << constraint.name << "@" << constraint.target_ecu << "\n";
+                std::cout << "      Type: " << constraint.type << "\n";
+                std::cout << "      Min Security Version: " << constraint.min_security_version << "\n";
+                if (constraint.max_security_version > 0) {
+                    std::cout << "      Max Security Version: " << constraint.max_security_version << "\n";
+                } else {
+                    std::cout << "      Max Security Version: (no limit)\n";
+                }
+            }
+        } else {
+            std::cout << "\nRequires: (no constraints)\n";
+        }
+
+        std::cout << "\n⚠️  Note: This metadata is UNVERIFIED. Use only for filtering.\n";
+        std::cout << "    Device must validate using verified manifest data.\n";
+
     } catch (const std::exception& e) {
         std::cout << "⚠️  Failed to parse device metadata: " << e.what() << "\n";
     }
@@ -187,14 +243,7 @@ void InspectManifest(X509* x509, bool verbose, bool json_output) {
 
         std::cout << "\n--- Manifest Fields ---\n\n";
         std::cout << "Schema version: " << manifest.GetVersion() << "\n";
-        std::cout << "Manifest version: " << manifest.GetManifestVersion() << "\n";
-        std::cout << "Release counter: " << manifest.GetReleaseCounter() << "\n";
-
-        // Display semantic version if present
-        auto sw_version = manifest.GetSoftwareVersion();
-        if (sw_version.has_value()) {
-            std::cout << "Software version: " << sw_version->ToString() << "\n";
-        }
+        std::cout << "Manifest version (metadata sequence): " << manifest.GetManifestVersion() << "\n";
 
         // Signature
         auto signature = manifest.GetSignature();
@@ -221,6 +270,8 @@ void InspectManifest(X509* x509, bool verbose, bool json_output) {
             std::cout << "      Type: " << a.type << "\n";
             std::cout << "      Target ECU: " << a.target_ecu << "\n";
             std::cout << "      Install Order: " << a.install_order << "\n";
+            std::cout << "      Version: " << a.version.ToString() << "\n";
+            std::cout << "      Security Version: " << a.security_version << "\n";
             std::cout << "      Hash Algorithm: " << a.hash_algorithm << "\n";
             std::cout << "      Expected Hash: " << HexDump(a.expected_hash) << "\n";
             std::cout << "      Plaintext Size: " << a.size << " bytes\n";
@@ -228,12 +279,15 @@ void InspectManifest(X509* x509, bool verbose, bool json_output) {
             std::cout << "      Ciphertext Size: " << a.ciphertext_size << " bytes\n";
             std::cout << "      Signature Algorithm: " << a.signature_algorithm << "\n";
             std::cout << "      Signature: " << HexDump(a.signature) << "\n";
-            std::cout << "      Content Addressable: " << (a.content_addressable ? "Yes" : "No") << "\n";
 
             if (!a.sources.empty()) {
                 std::cout << "      Sources:\n";
                 for (const auto& src : a.sources) {
-                    std::cout << "        - URI: " << src.uri << " (priority: " << src.priority << ")\n";
+                    std::cout << "        - URI: " << src.uri << " (priority: " << src.priority;
+                    if (!src.type.empty()) {
+                        std::cout << ", type: " << src.type;
+                    }
+                    std::cout << ")\n";
                 }
             }
         }
@@ -323,8 +377,8 @@ int main(int argc, char* argv[]) {
         // Inspect certificate
         InspectX509Certificate(x509, verbose);
 
-        // Inspect device metadata
-        InspectDeviceMetadata(cert);
+        // Inspect device metadata (raw extension data)
+        InspectDeviceMetadata(x509);
 
         // Inspect manifest
         InspectManifest(x509, verbose, json_output);
