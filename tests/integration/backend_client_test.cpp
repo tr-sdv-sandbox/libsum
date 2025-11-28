@@ -227,26 +227,20 @@ TEST(IntegrationTest, MultiArtifactUpdate) {
     backend_meta.device_type = "Backend";
 
     // First create self-signed CA cert
-    Manifest dummy_manifest;
-    dummy_manifest.SetManifestVersion(1);
-    DeviceMetadata ca_meta;
-    ca_meta.hardware_id = "CA";
-    ca_meta.manufacturer = "TestCorp";
-    ca_meta.device_type = "CA";
-
-    auto ca_cert = CreateCertificateWithManifest(
-        dummy_manifest,
+    // Create root CA
+    auto ca_cert = CreateCACertificate(
         ca_privkey,
         ca_pubkey,
-        ca_meta
+        "Test Root CA"
     );
 
-    // Create backend signing certificate
-    auto backend_cert = CreateCertificateWithManifest(
-        manifest,
-        ca_privkey,  // Signed by CA
+    // Create intermediate CA (backend signing certificate)
+    auto backend_cert = CreateCACertificate(
+        ca_privkey,  // Signed by root CA
         backend_pubkey,
-        backend_meta
+        "Test Intermediate CA",
+        1825,  // 5 years
+        &ca_cert
     );
 
     // Set the signing certificate in manifest
@@ -401,36 +395,17 @@ TEST(IntegrationTest, ManifestEmbeddedInCertificate) {
     auto device_pubkey = PublicKey::FromPrivateKey(device_privkey);
 
     // Create Root CA (self-signed)
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "Acme Corp";
-    root_meta.device_type = "Root-CA";
-
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest,
+    auto root_cert = CreateCACertificate(
         root_privkey,
         root_pubkey,
-        root_meta,
         "Root CA",
-        3650,
-        nullptr  // self-signed
+        3650
     );
 
     // Create Intermediate CA (signed by root)
-    DeviceMetadata intermediate_meta;
-    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
-    intermediate_meta.manufacturer = "Acme Corp";
-    intermediate_meta.device_type = "Intermediate-CA";
-
-    Manifest intermediate_manifest;
-    intermediate_manifest.SetManifestVersion(1);
-    auto intermediate_cert = CreateCertificateWithManifest(
-        intermediate_manifest,
+    auto intermediate_cert = CreateCACertificate(
         root_privkey,  // Signed by root
         intermediate_pubkey,
-        intermediate_meta,
         "Intermediate CA",
         1825,
         &root_cert
@@ -461,30 +436,21 @@ TEST(IntegrationTest, ManifestEmbeddedInCertificate) {
         365
     );
 
-    // Verify certificate has both extensions
-    EXPECT_TRUE(update_cert.HasManifestExtension());
-    EXPECT_TRUE(update_cert.HasDeviceMetadata());
+    // Serialize and reload with verification (simulates real-world workflow)
+    std::string pem = update_cert.ToPEM();
+    auto verified_cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert, time(nullptr));
 
-    // Extract and verify device metadata using proper root CA
-    auto device_metadata = update_cert.GetDeviceMetadata(root_cert, time(nullptr));
+    // Extract device metadata (already verified at load)
+    auto device_metadata = verified_cert.GetDeviceMetadata();
     EXPECT_EQ(device_metadata.hardware_id, "TEST-DEVICE-12345");
     EXPECT_EQ(device_metadata.manufacturer, "Acme Corp");
     EXPECT_EQ(device_metadata.device_type, "ESP32-Gateway");
     EXPECT_EQ(device_metadata.hardware_version, "v2.1");
 
-    // Verify operational metadata
-    EXPECT_EQ(device_metadata.manifest_version, 100);
-    EXPECT_EQ(device_metadata.provides.size(), 1);
-    EXPECT_EQ(device_metadata.provides[0].name, "firmware");
+    // Extract manifest (already verified at load)
+    auto extracted_manifest = verified_cert.GetManifest();
 
-    // Extract and verify manifest from certificate
-    auto manifest_data = update_cert.GetVerifiedManifest(root_cert, time(nullptr));
-    EXPECT_FALSE(manifest_data.empty());
-
-    // Parse extracted manifest
-    auto extracted_manifest = Manifest::LoadFromProtobuf(manifest_data);
-
-    // Verify manifest contents
+    // Verify operational metadata is in manifest, not device metadata
     EXPECT_EQ(extracted_manifest.GetManifestVersion(), 100);
     EXPECT_EQ(extracted_manifest.GetArtifacts().size(), 1);
     EXPECT_EQ(extracted_manifest.GetArtifacts()[0].name, "firmware");
@@ -546,13 +512,8 @@ TEST(IntegrationTest, RejectTamperedDeviceMetadata) {
     // Load tampered certificate
     auto tampered_cert = Certificate::LoadFromDER(tampered_cert_der);
 
-    // CRITICAL: GetDeviceMetadata should THROW because signature verification fails
-    // The X.509 signature covers ALL fields including extensions
-    EXPECT_THROW({
-        auto tampered_meta = tampered_cert.GetDeviceMetadata(tampered_cert, time(nullptr));
-    }, CryptoError) << "Tampered certificate MUST fail verification";
-
-    // Signature verification should also FAIL
+    // CRITICAL: Signature verification MUST fail because the device metadata extension
+    // was tampered with. The X.509 signature covers ALL fields including extensions.
     EXPECT_FALSE(tampered_cert.VerifyChain(tampered_cert, time(nullptr)))
         << "Tampered certificate MUST fail signature verification";
 }
@@ -618,12 +579,10 @@ TEST(IntegrationTest, RejectTamperedManifest) {
     // Load tampered certificate
     auto tampered_cert = Certificate::LoadFromDER(tampered_cert_der);
 
-    // CRITICAL: GetVerifiedManifest MUST throw because signature verification fails
-    // The X.509 signature covers ALL fields including extensions
-    // With the new API, you cannot even access the manifest without verification
-    EXPECT_THROW({
-        auto manifest_data = tampered_cert.GetVerifiedManifest(tampered_cert, time(nullptr));
-    }, CryptoError) << "Tampered certificate MUST reject manifest extraction";
+    // CRITICAL: Signature verification MUST fail because the manifest extension
+    // was tampered with. The X.509 signature covers ALL fields including extensions.
+    EXPECT_FALSE(tampered_cert.VerifyChain(tampered_cert, time(nullptr)))
+        << "Tampered certificate MUST fail signature verification";
 }
 
 // Demonstrate proper certificate chain verification protects extensions
@@ -675,8 +634,9 @@ TEST(IntegrationTest, CertificateSignatureProtectsExtensions) {
     //
     // This provides cryptographic integrity protection for the entire update package.
 
-    EXPECT_TRUE(cert.HasDeviceMetadata());
-    EXPECT_TRUE(cert.HasManifestExtension());
+    // Verify extensions were embedded in certificate
+    EXPECT_TRUE(cert.HasExtension(oid::DEVICE_METADATA));
+    EXPECT_TRUE(cert.HasExtension(oid::MANIFEST));
 }
 
 // Test proper CA hierarchy with separate CA and end-entity certificates
@@ -687,39 +647,20 @@ TEST(IntegrationTest, ProperCAHierarchyVerification) {
     auto root_privkey = PrivateKey::Generate(KeyType::Ed25519);
     auto root_pubkey = PublicKey::FromPrivateKey(root_privkey);
 
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "TestCA";
-    root_meta.device_type = "CA";
-
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest,
+    auto root_cert = CreateCACertificate(
         root_privkey,  // Self-signed
         root_pubkey,
-        root_meta,
         "Root CA",
-        3650,
-        nullptr
+        3650
     );
 
     // Intermediate CA
     auto intermediate_privkey = PrivateKey::Generate(KeyType::Ed25519);
     auto intermediate_pubkey = PublicKey::FromPrivateKey(intermediate_privkey);
 
-    Manifest intermediate_manifest;
-    intermediate_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate_meta;
-    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
-    intermediate_meta.manufacturer = "TestCA";
-    intermediate_meta.device_type = "Intermediate-CA";
-
-    auto intermediate_cert = CreateCertificateWithManifest(
-        intermediate_manifest,
+    auto intermediate_cert = CreateCACertificate(
         root_privkey,  // Signed by root
         intermediate_pubkey,
-        intermediate_meta,
         "Intermediate CA",
         1825,
         &root_cert
@@ -750,39 +691,32 @@ TEST(IntegrationTest, ProperCAHierarchyVerification) {
         365
     );
 
+    // Serialize and reload with verification
+    std::string pem = update_cert.ToPEM();
+    auto verified_cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert, time(nullptr));
+
     // Can extract verified manifest and metadata
-    auto verified_manifest_data = update_cert.GetVerifiedManifest(root_cert, time(nullptr));
-    auto verified_manifest = Manifest::LoadFromProtobuf(verified_manifest_data);
+    auto verified_manifest = verified_cert.GetManifest();
     EXPECT_EQ(verified_manifest.GetManifestVersion(), 42);
 
-    auto verified_meta = update_cert.GetDeviceMetadata(root_cert, time(nullptr));
+    auto verified_meta = verified_cert.GetDeviceMetadata();
     EXPECT_EQ(verified_meta.hardware_id, "DEVICE-CA-TEST");
 
     // Create a different root CA
     auto wrong_root_privkey = PrivateKey::Generate(KeyType::Ed25519);
     auto wrong_root_pubkey = PublicKey::FromPrivateKey(wrong_root_privkey);
 
-    Manifest wrong_root_manifest;
-    wrong_root_manifest.SetManifestVersion(1);
-    DeviceMetadata wrong_root_meta;
-    wrong_root_meta.hardware_id = "WRONG-ROOT-CA";
-    wrong_root_meta.manufacturer = "WrongCA";
-    wrong_root_meta.device_type = "CA";
-
-    auto wrong_root_cert = CreateCertificateWithManifest(
-        wrong_root_manifest,
+    auto wrong_root_cert = CreateCACertificate(
         wrong_root_privkey,
         wrong_root_pubkey,
-        wrong_root_meta,
         "Wrong Root CA",
-        3650,
-        nullptr
+        3650
     );
 
-    // GetVerifiedManifest should throw with wrong root CA
+    // LoadFromPEM should throw with wrong root CA (verification happens at load time)
     EXPECT_THROW({
-        auto manifest_data = update_cert.GetVerifiedManifest(wrong_root_cert, time(nullptr));
-    }, CryptoError) << "Should reject manifest when verified with wrong root CA";
+        auto bad_cert = crypto::UpdateCertificate::LoadFromPEM(pem, wrong_root_cert, time(nullptr));
+    }, CryptoError) << "Should reject certificate when verified with wrong root CA";
 }
 
 // Test timestamp validation for certificate expiration
@@ -873,11 +807,9 @@ TEST(IntegrationTest, InvalidJSONInExtensions) {
         try {
             auto tampered_cert = Certificate::LoadFromDER(tampered_cert_der);
 
-            // GetDeviceMetadata should throw when signature verification fails
-            // (corrupt protobuf will cause X.509 signature verification to fail)
-            EXPECT_THROW({
-                tampered_cert.GetDeviceMetadata(tampered_cert, time(nullptr));
-            }, CryptoError) << "Corrupt certificate should fail verification";
+            // Signature verification should fail (corrupt protobuf causes signature mismatch)
+            EXPECT_FALSE(tampered_cert.VerifyChain(tampered_cert, time(nullptr)))
+                << "Corrupt certificate should fail verification";
 
         } catch (const CryptoError& e) {
             // Certificate loading might fail due to corruption - that's also acceptable
@@ -971,15 +903,8 @@ TEST(IntegrationTest, ManifestSignatureVerification) {
     manifest.SetMetadata("version", "1.0");
 
     // Create self-signed CA certificate for manifest signing
-    DeviceMetadata ca_meta;
-    ca_meta.hardware_id = "CA-TEST";
-    ca_meta.manufacturer = "TestCA";
-    ca_meta.device_type = "CA";
-
-    Manifest ca_manifest;
-    ca_manifest.SetManifestVersion(1);
-    auto ca_cert = CreateCertificateWithManifest(
-        ca_manifest, ca_privkey, ca_pubkey, ca_meta
+    auto ca_cert = CreateCACertificate(
+        ca_privkey, ca_pubkey, "CA-TEST"
     );
 
     // Set signing certificate in manifest
@@ -1018,14 +943,7 @@ TEST(IntegrationTest, ManifestSignatureExcludesSignatureField) {
     manifest.SetMetadata("test", "data");
 
     // Create dummy cert
-    DeviceMetadata meta;
-    meta.hardware_id = "TEST";
-    meta.manufacturer = "Test";
-    meta.device_type = "Test";
-
-    Manifest cert_manifest;
-    cert_manifest.SetManifestVersion(1);
-    auto cert = CreateCertificateWithManifest(cert_manifest, privkey, pubkey, meta);
+    auto cert = CreateCACertificate(privkey, pubkey, "TEST");
     manifest.SetSigningCertificate(cert.ToDER());
 
     // Sign the manifest (inline)
@@ -1191,37 +1109,19 @@ TEST(IntegrationTest, RejectWrongIntermediate) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     // Create root CA (self-signed)
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "Test";
-    root_meta.device_type = "CA";
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest, root_key, root_pub, root_meta, "Root CA", 365
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 365
     );
 
     // Create intermediate1 (signed by root)
-    Manifest intermediate1_manifest;
-    intermediate1_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate1_meta;
-    intermediate1_meta.hardware_id = "INTERMEDIATE-CA-1";
-    intermediate1_meta.manufacturer = "Test";
-    intermediate1_meta.device_type = "Intermediate-CA";
-    auto intermediate1_cert = CreateCertificateWithManifest(
-        intermediate1_manifest, root_key, intermediate1_pub, intermediate1_meta,
+    auto intermediate1_cert = CreateCACertificate(
+        root_key, intermediate1_pub,
         "Intermediate CA 1", 365, &root_cert
     );
 
     // Create intermediate2 (also signed by root, but different)
-    Manifest intermediate2_manifest;
-    intermediate2_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate2_meta;
-    intermediate2_meta.hardware_id = "INTERMEDIATE-CA-2";
-    intermediate2_meta.manufacturer = "Test";
-    intermediate2_meta.device_type = "Intermediate-CA";
-    auto intermediate2_cert = CreateCertificateWithManifest(
-        intermediate2_manifest, root_key, intermediate2_pub, intermediate2_meta,
+    auto intermediate2_cert = CreateCACertificate(
+        root_key, intermediate2_pub,
         "Intermediate CA 2", 365, &root_cert
     );
 
@@ -1257,14 +1157,8 @@ TEST(IntegrationTest, RejectWrongIntermediate) {
     // Now test with WRONG root CA - should fail
     auto wrong_root_key = PrivateKey::Generate(KeyType::Ed25519);
     auto wrong_root_pub = PublicKey::FromPrivateKey(wrong_root_key);
-    Manifest wrong_root_manifest;
-    wrong_root_manifest.SetManifestVersion(1);
-    DeviceMetadata wrong_root_meta;
-    wrong_root_meta.hardware_id = "WRONG-ROOT";
-    wrong_root_meta.manufacturer = "Test";
-    wrong_root_meta.device_type = "CA";
-    auto wrong_root_cert = CreateCertificateWithManifest(
-        wrong_root_manifest, wrong_root_key, wrong_root_pub, wrong_root_meta,
+    auto wrong_root_cert = CreateCACertificate(
+        wrong_root_key, wrong_root_pub,
         "Wrong Root CA", 3650
     );
 
@@ -1282,27 +1176,14 @@ TEST(IntegrationTest, RejectNonSelfSignedRootCA) {
     auto other_pub = PublicKey::FromPrivateKey(other_key);
 
     // Create "root" CA signed by other_key instead of itself
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "FAKE-ROOT";
-    root_meta.manufacturer = "Test";
-    root_meta.device_type = "CA";
-
     // This creates a certificate with root_pub but signed by other_key
     // and with issuer DN from a different cert - not truly self-signed
-    Manifest other_manifest;
-    other_manifest.SetManifestVersion(1);
-    DeviceMetadata other_meta;
-    other_meta.hardware_id = "OTHER-CA";
-    other_meta.manufacturer = "Test";
-    other_meta.device_type = "CA";
-    auto other_cert = CreateCertificateWithManifest(
-        other_manifest, other_key, other_pub, other_meta, "Other CA", 365
+    auto other_cert = CreateCACertificate(
+        other_key, other_pub, "Other CA", 365
     );
 
-    auto fake_root = CreateCertificateWithManifest(
-        root_manifest, other_key, root_pub, root_meta, "Fake Root", 365, &other_cert
+    auto fake_root = CreateCACertificate(
+        other_key, root_pub, "Fake Root", 365, &other_cert
     );
 
     // Create update certificate
@@ -1347,31 +1228,17 @@ protected:
         auto root_privkey = PrivateKey::Generate(KeyType::Ed25519);
         auto root_pubkey = PublicKey::FromPrivateKey(root_privkey);
 
-        DeviceMetadata root_meta;
-        root_meta.hardware_id = "ROOT-CA";
-        root_meta.manufacturer = "TestCorp";
-        root_meta.device_type = "Root-CA";
-
-        Manifest root_manifest;
-        root_manifest.SetManifestVersion(1);
-        root_cert = CreateCertificateWithManifest(
-            root_manifest, root_privkey, root_pubkey, root_meta,
-            "Root CA", 3650, nullptr
+        root_cert = CreateCACertificate(
+            root_privkey, root_pubkey,
+            "Root CA", 3650
         );
 
         // Intermediate CA
         intermediate_key = PrivateKey::Generate(KeyType::Ed25519);
         auto intermediate_pub = PublicKey::FromPrivateKey(intermediate_key);
 
-        DeviceMetadata intermediate_meta;
-        intermediate_meta.hardware_id = "INTERMEDIATE";
-        intermediate_meta.manufacturer = "TestCorp";
-        intermediate_meta.device_type = "Intermediate-CA";
-
-        Manifest intermediate_manifest;
-        intermediate_manifest.SetManifestVersion(1);
-        intermediate_cert = CreateCertificateWithManifest(
-            intermediate_manifest, root_privkey, intermediate_pub, intermediate_meta,
+        intermediate_cert = CreateCACertificate(
+            root_privkey, intermediate_pub,
             "Intermediate CA", 1825, &root_cert
         );
 
@@ -1519,27 +1386,13 @@ TEST(IntegrationTest, RevokeCertificateByTimestamp) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     // Create root CA cert (self-signed)
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "TestCorp";
-    root_meta.device_type = "RootCA";
-
-    Manifest root_dummy;
-    root_dummy.SetManifestVersion(1);
-    auto root_cert = CreateCertificateWithManifest(
-        root_dummy, root_key, root_pub, root_meta, "Root CA", 3650, nullptr
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 3650
     );
 
     // Create OLD intermediate CA (issued at T0)
-    DeviceMetadata intermediate_meta;
-    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
-    intermediate_meta.manufacturer = "TestCorp";
-    intermediate_meta.device_type = "IntermediateCA";
-
-    Manifest intermediate_dummy;
-    intermediate_dummy.SetManifestVersion(1);
-    auto old_intermediate_cert = CreateCertificateWithManifest(
-        intermediate_dummy, root_key, intermediate_pub, intermediate_meta,
+    auto old_intermediate_cert = CreateCACertificate(
+        root_key, intermediate_pub,
         "Intermediate CA v1", 365, &root_cert
     );
 
@@ -1549,13 +1402,17 @@ TEST(IntegrationTest, RevokeCertificateByTimestamp) {
     // Create update certificate signed by old intermediate
     std::vector<uint8_t> software = {0x01, 0x02, 0x03};
     auto encrypted_artifact = EncryptSoftware(software);
+    DeviceMetadata device_meta;
+    device_meta.hardware_id = "TEST-DEVICE";
+    device_meta.manufacturer = "TestCorp";
+    device_meta.device_type = "TestDevice";
     ManifestBuilder builder(intermediate_key, old_intermediate_cert);
     builder.AddArtifact("firmware", encrypted_artifact)
         .SetType("firmware")
         .SetTargetECU("primary")
         .SetVersion(SemVer{0, 0, 100, "", ""});
     auto [update_cert, encrypted_files] = builder.BuildCertificate(
-        device_pub, intermediate_meta, 100, 90
+        device_pub, device_meta, 100, 90
     );
     auto encrypted = encrypted_files.at("firmware");
 
@@ -1597,27 +1454,13 @@ TEST(IntegrationTest, NewIntermediateAfterRevocation) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     // Root CA
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "TestCorp";
-    root_meta.device_type = "RootCA";
-
-    Manifest root_dummy;
-    root_dummy.SetManifestVersion(1);
-    auto root_cert = CreateCertificateWithManifest(
-        root_dummy, root_key, root_pub, root_meta, "Root CA", 3650, nullptr
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 3650
     );
 
     // Old intermediate CA
-    DeviceMetadata intermediate_meta;
-    intermediate_meta.hardware_id = "INTERMEDIATE-CA";
-    intermediate_meta.manufacturer = "TestCorp";
-    intermediate_meta.device_type = "IntermediateCA";
-
-    Manifest intermediate_dummy;
-    intermediate_dummy.SetManifestVersion(1);
-    auto old_intermediate_cert = CreateCertificateWithManifest(
-        intermediate_dummy, root_key, old_intermediate_pub, intermediate_meta,
+    auto old_intermediate_cert = CreateCACertificate(
+        root_key, old_intermediate_pub,
         "Intermediate CA v1", 365, &root_cert
     );
 
@@ -1628,23 +1471,25 @@ TEST(IntegrationTest, NewIntermediateAfterRevocation) {
     sleep(1);
 
     // Issue NEW intermediate CA after revocation
-    Manifest new_intermediate_dummy;
-    new_intermediate_dummy.SetManifestVersion(2);
-    auto new_intermediate_cert = CreateCertificateWithManifest(
-        new_intermediate_dummy, root_key, new_intermediate_pub, intermediate_meta,
+    auto new_intermediate_cert = CreateCACertificate(
+        root_key, new_intermediate_pub,
         "Intermediate CA v2", 365, &root_cert
     );
 
     // Create update with NEW intermediate
     std::vector<uint8_t> software = {0x01, 0x02, 0x03};
     auto encrypted_artifact = EncryptSoftware(software);
+    DeviceMetadata device_meta;
+    device_meta.hardware_id = "TEST-DEVICE";
+    device_meta.manufacturer = "TestCorp";
+    device_meta.device_type = "TestDevice";
     ManifestBuilder builder(new_intermediate_key, new_intermediate_cert);
     builder.AddArtifact("firmware", encrypted_artifact)
         .SetType("firmware")
         .SetTargetECU("primary")
         .SetVersion(SemVer{0, 0, 100, "", ""});
     auto [update_cert, encrypted_files] = builder.BuildCertificate(
-        device_pub, intermediate_meta, 100, 90
+        device_pub, device_meta, 100, 90
     );
     auto encrypted = encrypted_files.at("firmware");
 
@@ -1667,17 +1512,11 @@ TEST(IntegrationTest, RejectChainWithNoIntermediates) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     // Create root CA (self-signed)
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "Test";
-    root_meta.device_type = "CA";
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest, root_key, root_pub, root_meta, "Root CA", 365, nullptr
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 365
     );
 
-    // Create update certificate signed directly by root (no intermediate)
+    // Try to create update certificate signed directly by root (no intermediate)
     std::vector<uint8_t> software = {1, 2, 3, 4};
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
@@ -1690,18 +1529,13 @@ TEST(IntegrationTest, RejectChainWithNoIntermediates) {
         .SetType("firmware")
         .SetTargetECU("primary")
         .SetVersion(SemVer{0, 0, 1, "", ""});
-    auto [update_cert, encrypted_files] = builder.BuildCertificate(
-        device_pub, device_meta, 1, 90
-    );
-    auto encrypted = encrypted_files.at("firmware");
 
-    // update_cert has root_cert embedded as "intermediate" (from BuildCertificate)
-    // But root_cert is self-signed, so validation should reject this
-    ManifestValidator validator(root_cert, device_key);
-
-    EXPECT_THROW({
-        validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject self-signed intermediate (opinionated: must have proper 3-tier PKI)";
+    // Opinionated API enforces 3-tier PKI at creation time
+    // BuildCertificate will call CreateUpdateCertificate which rejects self-signed intermediates
+    EXPECT_THROW(
+        builder.BuildCertificate(device_pub, device_meta, 1, 90),
+        CryptoError
+    ) << "Should reject self-signed intermediate (opinionated: must have proper 3-tier PKI)";
 }
 
 TEST(IntegrationTest, RejectChainWithTooManyIntermediates) {
@@ -1718,36 +1552,19 @@ TEST(IntegrationTest, RejectChainWithTooManyIntermediates) {
     // Create root CA (self-signed)
     Manifest root_manifest;
     root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "Test";
-    root_meta.device_type = "CA";
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest, root_key, root_pub, root_meta, "Root CA", 365, nullptr
+    // Create root CA
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 365
     );
 
     // Create intermediate1 (signed by root)
-    Manifest intermediate1_manifest;
-    intermediate1_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate1_meta;
-    intermediate1_meta.hardware_id = "INTERMEDIATE-CA-1";
-    intermediate1_meta.manufacturer = "Test";
-    intermediate1_meta.device_type = "Intermediate-CA";
-    auto intermediate1_cert = CreateCertificateWithManifest(
-        intermediate1_manifest, root_key, intermediate1_pub, intermediate1_meta,
-        "Intermediate CA 1", 365, &root_cert
+    auto intermediate1_cert = CreateCACertificate(
+        root_key, intermediate1_pub, "Intermediate CA 1", 365, &root_cert
     );
 
     // Create intermediate2 (signed by intermediate1)
-    Manifest intermediate2_manifest;
-    intermediate2_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate2_meta;
-    intermediate2_meta.hardware_id = "INTERMEDIATE-CA-2";
-    intermediate2_meta.manufacturer = "Test";
-    intermediate2_meta.device_type = "Intermediate-CA";
-    auto intermediate2_cert = CreateCertificateWithManifest(
-        intermediate2_manifest, intermediate1_key, intermediate2_pub, intermediate2_meta,
-        "Intermediate CA 2", 365, &intermediate1_cert
+    auto intermediate2_cert = CreateCACertificate(
+        intermediate1_key, intermediate2_pub, "Intermediate CA 2", 365, &intermediate1_cert
     );
 
     // Create update certificate signed by intermediate2
@@ -1797,29 +1614,16 @@ TEST(IntegrationTest, RejectSelfSignedIntermediate) {
     auto device_pub = PublicKey::FromPrivateKey(device_key);
 
     // Create root CA (self-signed)
-    Manifest root_manifest;
-    root_manifest.SetManifestVersion(1);
-    DeviceMetadata root_meta;
-    root_meta.hardware_id = "ROOT-CA";
-    root_meta.manufacturer = "Test";
-    root_meta.device_type = "CA";
-    auto root_cert = CreateCertificateWithManifest(
-        root_manifest, root_key, root_pub, root_meta, "Root CA", 365, nullptr
+    auto root_cert = CreateCACertificate(
+        root_key, root_pub, "Root CA", 365
     );
 
     // Create self-signed intermediate (signed by itself, not root)
-    Manifest intermediate_manifest;
-    intermediate_manifest.SetManifestVersion(1);
-    DeviceMetadata intermediate_meta;
-    intermediate_meta.hardware_id = "SELF-SIGNED-INTERMEDIATE";
-    intermediate_meta.manufacturer = "Test";
-    intermediate_meta.device_type = "Intermediate-CA";
-    auto intermediate_cert = CreateCertificateWithManifest(
-        intermediate_manifest, intermediate_key, intermediate_pub, intermediate_meta,
-        "Self-Signed Intermediate", 365, nullptr  // nullptr = self-signed
+    auto intermediate_cert = CreateCACertificate(
+        intermediate_key, intermediate_pub, "Self-Signed Intermediate", 365  // self-signed
     );
 
-    // Create update certificate signed by intermediate
+    // Try to create update certificate signed by self-signed intermediate
     std::vector<uint8_t> software = {1, 2, 3, 4};
     DeviceMetadata device_meta;
     device_meta.hardware_id = "DEVICE-001";
@@ -1832,16 +1636,11 @@ TEST(IntegrationTest, RejectSelfSignedIntermediate) {
         .SetType("firmware")
         .SetTargetECU("primary")
         .SetVersion(SemVer{0, 0, 1, "", ""});
-    auto [update_cert, encrypted_files] = builder.BuildCertificate(
-        device_pub, device_meta, 1, 90
-    );
-    auto encrypted = encrypted_files.at("firmware");
 
-    // update_cert has self-signed intermediate_cert embedded (from BuildCertificate)
-    // Validation should fail because intermediate is self-signed, not signed by root
-    ManifestValidator validator(root_cert, device_key);
-
-    EXPECT_THROW({
-        validator.ValidateCertificate(update_cert, time(nullptr));
-    }, CryptoError) << "Should reject self-signed intermediate certificate";
+    // Opinionated API enforces 3-tier PKI at creation time
+    // BuildCertificate will call CreateUpdateCertificate which rejects self-signed intermediates
+    EXPECT_THROW(
+        builder.BuildCertificate(device_pub, device_meta, 1, 90),
+        CryptoError
+    ) << "Should reject self-signed intermediate certificate";
 }

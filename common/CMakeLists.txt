@@ -49,6 +49,7 @@ target_link_libraries(sum-common PUBLIC
 if(BUILD_TESTS)
     add_executable(sum-common-tests
         tests/crypto_test.cpp
+        tests/certificate_test.cpp
         tests/manifest_test.cpp
     )
 

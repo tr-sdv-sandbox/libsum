@@ -88,6 +88,7 @@ endif()
 if(BUILD_TESTS)
     add_executable(sum-backend-tests
         tests/manifest_builder_test.cpp
+        tests/update_certificate_test.cpp
     )
 
     target_link_libraries(sum-backend-tests PRIVATE

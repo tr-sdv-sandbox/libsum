@@ -173,7 +173,6 @@ public:
     mutable bool encryption_cache_valid_ = false;
 
     // Cached copies of byte fields (protobuf uses std::string for bytes)
-    mutable std::vector<uint8_t> manifest_hash_cache_;
     mutable std::vector<uint8_t> signature_cache_;
     mutable std::vector<uint8_t> signing_cert_cache_;
 
@@ -272,14 +271,8 @@ uint64_t Manifest::GetManifestVersion() const {
     return impl_->proto_.manifest_version();
 }
 
-
-const std::vector<uint8_t>& Manifest::GetManifestHash() const {
-    const std::string& hash_str = impl_->proto_.manifest_hash();
-    impl_->manifest_hash_cache_.assign(
-        reinterpret_cast<const uint8_t*>(hash_str.data()),
-        reinterpret_cast<const uint8_t*>(hash_str.data()) + hash_str.size()
-    );
-    return impl_->manifest_hash_cache_;
+ManifestType Manifest::GetType() const {
+    return static_cast<ManifestType>(impl_->proto_.type());
 }
 
 const std::vector<SoftwareArtifact>& Manifest::GetArtifacts() const {
@@ -356,10 +349,6 @@ void Manifest::SetManifestVersion(uint64_t version) {
     impl_->proto_.set_manifest_version(version);
 }
 
-void Manifest::SetManifestHash(const std::vector<uint8_t>& hash) {
-    impl_->proto_.set_manifest_hash(hash.data(), hash.size());
-}
-
 void Manifest::AddArtifact(SoftwareArtifact artifact) {
     ToProto(artifact, impl_->proto_.add_artifacts());
     impl_->InvalidateCaches();
@@ -398,27 +387,6 @@ DeviceMetadata DeviceMetadata::FromProtobuf(const std::vector<uint8_t>& data) {
     metadata.device_type = proto.device_type();
     metadata.hardware_version = proto.hardware_version();
 
-    // Operational metadata
-    metadata.manifest_version = proto.manifest_version();
-    metadata.manifest_type = static_cast<ManifestType>(proto.manifest_type());
-
-    // Provides
-    for (const auto& proto_artifact : proto.provides()) {
-        ArtifactInfo artifact;
-        artifact.name = proto_artifact.name();
-        artifact.type = proto_artifact.type();
-        artifact.target_ecu = proto_artifact.target_ecu();
-        artifact.security_version = proto_artifact.security_version();
-        if (proto_artifact.has_version()) {
-            artifact.version.major = proto_artifact.version().major();
-            artifact.version.minor = proto_artifact.version().minor();
-            artifact.version.patch = proto_artifact.version().patch();
-            artifact.version.prerelease = proto_artifact.version().prerelease();
-            artifact.version.build_metadata = proto_artifact.version().build_metadata();
-        }
-        metadata.provides.push_back(artifact);
-    }
-
     // Requires
     for (const auto& proto_constraint : proto.requires()) {
         ArtifactConstraint constraint;
@@ -440,30 +408,6 @@ std::vector<uint8_t> DeviceMetadata::ToProtobuf() const {
     proto.set_device_type(device_type);
     if (!hardware_version.empty()) {
         proto.set_hardware_version(hardware_version);
-    }
-
-    // Operational metadata
-    proto.set_manifest_version(manifest_version);
-    proto.set_manifest_type(static_cast<::sum::proto::ManifestType>(manifest_type));
-
-    // Provides
-    for (const auto& artifact : provides) {
-        auto* proto_artifact = proto.add_provides();
-        proto_artifact->set_name(artifact.name);
-        proto_artifact->set_type(artifact.type);
-        proto_artifact->set_target_ecu(artifact.target_ecu);
-        proto_artifact->set_security_version(artifact.security_version);
-
-        auto* proto_version = proto_artifact->mutable_version();
-        proto_version->set_major(artifact.version.major);
-        proto_version->set_minor(artifact.version.minor);
-        proto_version->set_patch(artifact.version.patch);
-        if (!artifact.version.prerelease.empty()) {
-            proto_version->set_prerelease(artifact.version.prerelease);
-        }
-        if (!artifact.version.build_metadata.empty()) {
-            proto_version->set_build_metadata(artifact.version.build_metadata);
-        }
     }
 
     // Requires

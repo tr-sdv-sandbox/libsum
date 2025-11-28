@@ -36,9 +36,7 @@ echo "Step 2: Creating root CA certificate..."
 ${BUILD_DIR}/backend/sum-create-ca \
   --ca-key ca.key \
   --subject-key ca.pub \
-  --hardware-id ROOT-CA \
   --common-name "Test Root CA" \
-  --manufacturer "Test Root CA" \
   --output ca.crt > /dev/null 2>&1
 echo "  ✅ Root CA certificate created"
 
@@ -49,9 +47,7 @@ ${BUILD_DIR}/backend/sum-keygen --public intermediate.key --output intermediate.
 ${BUILD_DIR}/backend/sum-create-ca \
   --ca-key ca.key \
   --subject-key intermediate.pub \
-  --hardware-id INTERMEDIATE-CA \
   --common-name "Test Intermediate CA" \
-  --manufacturer "Test Intermediate CA" \
   --sign-with ca.crt \
   --output intermediate.crt > /dev/null 2>&1
 echo "  ✅ Intermediate CA certificate created (signed by root CA)"

@@ -32,6 +32,202 @@ using namespace crypto::internal;  // For OID constants
 //
 // See x509_constants.h for OID definitions
 
+crypto::Certificate CreateCACertificate(
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const std::string& subject_name,
+    int validity_days,
+    const crypto::Certificate* issuer_cert
+) {
+    X509* cert = X509_new();
+    if (!cert) {
+        throw crypto::CryptoError("Failed to create X509 structure");
+    }
+
+    // Set version (X509 v3)
+    X509_set_version(cert, 2);
+
+    // Set serial number
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+
+    // Set validity period
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), validity_days * 24 * 3600);
+
+    // Set subject name
+    X509_NAME* subject = X509_NAME_new();
+    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+                               (const unsigned char*)subject_name.c_str(), -1, -1, 0);
+    X509_set_subject_name(cert, subject);
+
+    // Set issuer name
+    if (issuer_cert != nullptr) {
+        // Certificate signed by issuer
+        X509* issuer_x509 = static_cast<X509*>(
+            const_cast<crypto::Certificate*>(issuer_cert)->GetNativeHandle()
+        );
+        X509_NAME* issuer_subject = X509_get_subject_name(issuer_x509);
+        X509_set_issuer_name(cert, issuer_subject);
+    } else {
+        // Self-signed certificate - issuer = subject
+        X509_set_issuer_name(cert, subject);
+    }
+
+    X509_NAME_free(subject);
+
+    // Set public key
+    EVP_PKEY* pub_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PublicKey&>(subject_pubkey).GetNativeHandle()
+    );
+    X509_set_pubkey(cert, pub_pkey);
+
+    // Add CA-specific X.509 v3 extensions
+    // basicConstraints: CA:TRUE (critical - this is a CA)
+    X509_EXTENSION* basic_constraints = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE"
+    );
+    if (!basic_constraints) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create basicConstraints extension");
+    }
+    X509_add_ext(cert, basic_constraints, -1);
+    X509_EXTENSION_free(basic_constraints);
+
+    // keyUsage: keyCertSign, cRLSign (for CA operations)
+    X509_EXTENSION* key_usage = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_key_usage, "critical,keyCertSign,cRLSign"
+    );
+    if (!key_usage) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create keyUsage extension");
+    }
+    X509_add_ext(cert, key_usage, -1);
+    X509_EXTENSION_free(key_usage);
+
+    // Sign the certificate
+    EVP_PKEY* priv_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PrivateKey&>(signing_key).GetNativeHandle()
+    );
+
+    // Ed25519 uses its own internal hashing, so pass nullptr for the digest
+    if (!X509_sign(cert, priv_pkey, nullptr)) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to sign certificate");
+    }
+
+    // Convert to DER and create Certificate object
+    unsigned char* der = nullptr;
+    int len = i2d_X509(cert, &der);
+    X509_free(cert);
+
+    if (len < 0) {
+        throw crypto::CryptoError("Failed to encode certificate");
+    }
+
+    std::vector<uint8_t> der_vec(der, der + len);
+    OPENSSL_free(der);
+
+    return crypto::Certificate::LoadFromDER(der_vec);
+}
+
+crypto::Certificate CreateEndEntityCertificate(
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const std::string& subject_name,
+    int validity_days,
+    const crypto::Certificate* issuer_cert
+) {
+    X509* cert = X509_new();
+    if (!cert) {
+        throw crypto::CryptoError("Failed to create X509 structure");
+    }
+
+    // Set version (X509 v3)
+    X509_set_version(cert, 2);
+
+    // Set serial number
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+
+    // Set validity period
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), validity_days * 24 * 3600);
+
+    // Set subject name
+    X509_NAME* subject = X509_NAME_new();
+    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+                               (const unsigned char*)subject_name.c_str(), -1, -1, 0);
+    X509_set_subject_name(cert, subject);
+
+    // Set issuer name
+    if (issuer_cert != nullptr) {
+        // Certificate signed by issuer
+        X509* issuer_x509 = static_cast<X509*>(
+            const_cast<crypto::Certificate*>(issuer_cert)->GetNativeHandle()
+        );
+        X509_NAME* issuer_subject = X509_get_subject_name(issuer_x509);
+        X509_set_issuer_name(cert, issuer_subject);
+    } else {
+        // Self-signed certificate - issuer = subject
+        X509_set_issuer_name(cert, subject);
+    }
+
+    X509_NAME_free(subject);
+
+    // Set public key
+    EVP_PKEY* pub_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PublicKey&>(subject_pubkey).GetNativeHandle()
+    );
+    X509_set_pubkey(cert, pub_pkey);
+
+    // Add end-entity X.509 v3 extensions
+    // basicConstraints: CA:FALSE (critical - this is NOT a CA)
+    X509_EXTENSION* basic_constraints = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_basic_constraints, "critical,CA:FALSE"
+    );
+    if (!basic_constraints) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create basicConstraints extension");
+    }
+    X509_add_ext(cert, basic_constraints, -1);
+    X509_EXTENSION_free(basic_constraints);
+
+    // keyUsage: digitalSignature (for signing operations)
+    X509_EXTENSION* key_usage = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_key_usage, "critical,digitalSignature"
+    );
+    if (!key_usage) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create keyUsage extension");
+    }
+    X509_add_ext(cert, key_usage, -1);
+    X509_EXTENSION_free(key_usage);
+
+    // Sign the certificate
+    EVP_PKEY* priv_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PrivateKey&>(signing_key).GetNativeHandle()
+    );
+
+    // Ed25519 uses its own internal hashing, so pass nullptr for the digest
+    if (!X509_sign(cert, priv_pkey, nullptr)) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to sign certificate");
+    }
+
+    // Convert to DER and create Certificate object
+    unsigned char* der = nullptr;
+    int len = i2d_X509(cert, &der);
+    X509_free(cert);
+
+    if (len < 0) {
+        throw crypto::CryptoError("Failed to encode certificate");
+    }
+
+    std::vector<uint8_t> der_vec(der, der + len);
+    OPENSSL_free(der);
+
+    return crypto::Certificate::LoadFromDER(der_vec);
+}
+
 crypto::Certificate CreateCertificateWithManifest(
     const Manifest& manifest,
     const crypto::PrivateKey& signing_key,
@@ -215,6 +411,177 @@ crypto::Certificate CreateCertificateWithManifest(
     }
 
     return result_cert;
+}
+
+crypto::UpdateCertificate CreateUpdateCertificate(
+    const Manifest& manifest,
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const DeviceMetadata& device_metadata,
+    const crypto::Certificate& intermediate_cert,
+    const std::string& subject_name,
+    int validity_days
+) {
+    // Validate that intermediate_cert is not self-signed
+    X509* issuer_x509 = static_cast<X509*>(
+        const_cast<crypto::Certificate&>(intermediate_cert).GetNativeHandle()
+    );
+    X509_NAME* issuer_subject = X509_get_subject_name(issuer_x509);
+    X509_NAME* issuer_issuer = X509_get_issuer_name(issuer_x509);
+
+    if (!issuer_subject || !issuer_issuer) {
+        throw crypto::CryptoError("Invalid intermediate certificate");
+    }
+
+    if (X509_NAME_cmp(issuer_subject, issuer_issuer) == 0) {
+        throw crypto::CryptoError("intermediate_cert must not be self-signed (opinionated: must be intermediate CA, not root CA)");
+    }
+
+    // Validate required fields
+    if (device_metadata.hardware_id.empty()) {
+        throw crypto::CryptoError("DeviceMetadata.hardware_id is required");
+    }
+    if (device_metadata.manufacturer.empty()) {
+        throw crypto::CryptoError("DeviceMetadata.manufacturer is required (use 'CHANGEME' if testing)");
+    }
+    if (device_metadata.device_type.empty()) {
+        throw crypto::CryptoError("DeviceMetadata.device_type is required (use 'CHANGEME' if testing)");
+    }
+
+    X509* cert = X509_new();
+    if (!cert) {
+        throw crypto::CryptoError("Failed to create X509 structure");
+    }
+
+    // Set version (X509 v3)
+    X509_set_version(cert, 2);
+
+    // Set serial number
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+
+    // Set validity period
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), validity_days * 24 * 3600);
+
+    // Set subject name
+    X509_NAME* subject = X509_NAME_new();
+    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+                               (const unsigned char*)subject_name.c_str(), -1, -1, 0);
+    X509_set_subject_name(cert, subject);
+
+    // Set issuer name from intermediate cert
+    X509_set_issuer_name(cert, issuer_subject);
+
+    X509_NAME_free(subject);
+
+    // Set public key
+    EVP_PKEY* pub_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PublicKey&>(subject_pubkey).GetNativeHandle()
+    );
+    X509_set_pubkey(cert, pub_pkey);
+
+    // Add standard X.509 v3 extensions
+    // keyUsage: digitalSignature (for signing update manifests)
+    X509_EXTENSION* key_usage = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_key_usage, "critical,digitalSignature"
+    );
+    if (!key_usage) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create keyUsage extension");
+    }
+    X509_add_ext(cert, key_usage, -1);
+    X509_EXTENSION_free(key_usage);
+
+    // extendedKeyUsage: codeSigning (for software update signing)
+    X509_EXTENSION* ext_key_usage = X509V3_EXT_conf_nid(
+        nullptr, nullptr, NID_ext_key_usage, "critical,codeSigning"
+    );
+    if (!ext_key_usage) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create extendedKeyUsage extension");
+    }
+    X509_add_ext(cert, ext_key_usage, -1);
+    X509_EXTENSION_free(ext_key_usage);
+
+    // Embed device metadata as custom extension (protobuf binary)
+    std::vector<uint8_t> device_protobuf;
+    try {
+        device_protobuf = device_metadata.ToProtobuf();
+    } catch (const std::exception& e) {
+        X509_free(cert);
+        throw crypto::CryptoError(std::string("Failed to serialize device metadata: ") + e.what());
+    }
+
+    ASN1_OCTET_STRING* device_data = ASN1_OCTET_STRING_new();
+    ASN1_OCTET_STRING_set(device_data, device_protobuf.data(), device_protobuf.size());
+
+    X509_EXTENSION* device_ext = X509_EXTENSION_create_by_OBJ(
+        nullptr,
+        OBJ_txt2obj(DEVICE_METADATA_OID, 1),
+        1,  // critical - clients must understand device metadata
+        device_data
+    );
+
+    ASN1_OCTET_STRING_free(device_data);
+
+    if (!device_ext) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create device metadata extension");
+    }
+
+    X509_add_ext(cert, device_ext, -1);
+    X509_EXTENSION_free(device_ext);
+
+    // Embed manifest as custom extension (protobuf binary)
+    auto manifest_protobuf = manifest.ToProtobuf();
+
+    ASN1_OCTET_STRING* manifest_data = ASN1_OCTET_STRING_new();
+    ASN1_OCTET_STRING_set(manifest_data, manifest_protobuf.data(), manifest_protobuf.size());
+
+    X509_EXTENSION* ext = X509_EXTENSION_create_by_OBJ(
+        nullptr,
+        OBJ_txt2obj(MANIFEST_EXTENSION_OID, 1),
+        1,  // critical - clients must understand manifest
+        manifest_data
+    );
+
+    ASN1_OCTET_STRING_free(manifest_data);
+
+    if (!ext) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to create manifest extension");
+    }
+
+    X509_add_ext(cert, ext, -1);
+    X509_EXTENSION_free(ext);
+
+    // Sign the certificate
+    EVP_PKEY* priv_pkey = static_cast<EVP_PKEY*>(
+        const_cast<crypto::PrivateKey&>(signing_key).GetNativeHandle()
+    );
+
+    // Ed25519 uses its own internal hashing, so pass nullptr for the digest
+    if (!X509_sign(cert, priv_pkey, nullptr)) {
+        X509_free(cert);
+        throw crypto::CryptoError("Failed to sign certificate");
+    }
+
+    // Convert to DER and create Certificate object
+    unsigned char* der = nullptr;
+    int len = i2d_X509(cert, &der);
+    X509_free(cert);
+
+    if (len < 0) {
+        throw crypto::CryptoError("Failed to encode certificate");
+    }
+
+    std::vector<uint8_t> der_vec(der, der + len);
+    OPENSSL_free(der);
+
+    auto update_cert_only = crypto::Certificate::LoadFromDER(der_vec);
+
+    // Create UpdateCertificate with both cert and intermediate using factory method
+    return crypto::UpdateCertificate::FromCertificates(std::move(update_cert_only), intermediate_cert.Clone());
 }
 
 } // namespace sum

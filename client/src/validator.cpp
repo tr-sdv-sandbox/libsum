@@ -76,41 +76,24 @@ bool ManifestValidator::VerifyManifest(const Manifest& manifest) {
 }
 
 Manifest ManifestValidator::ValidateCertificate(
-    const crypto::Certificate& certificate,
+    const crypto::UpdateCertificate& update_certificate,
     int64_t trusted_time
 ) {
-    std::vector<uint8_t> manifest_data;
+    // Step 1: Serialize and reload with verification
+    // This ensures the certificate is verified against the validator's root CA
+    // and handles revocation checking atomically
+    std::string pem = update_certificate.ToPEM();
+    auto verified_cert = crypto::UpdateCertificate::LoadFromPEM(
+        pem,
+        impl_->backend_ca,
+        trusted_time,
+        impl_->reject_certs_before
+    );
 
-    // Step 1: Check intermediate certificate revocation (timestamp-based)
-    // SECURITY: Check BEFORE validation to avoid wasting CPU on revoked certs
-    if (impl_->reject_certs_before > 0) {
-        try {
-            int64_t intermediate_issuance = certificate.GetIntermediateIssuanceTime();
-            if (intermediate_issuance < impl_->reject_certs_before) {
-                throw crypto::CryptoError(
-                    "Intermediate certificate revoked: issued at " + std::to_string(intermediate_issuance) +
-                    " which is before revocation timestamp " + std::to_string(impl_->reject_certs_before)
-                );
-            }
-        } catch (const crypto::CryptoError& e) {
-            std::string msg = e.what();
-            // Re-throw if this is the revocation error
-            if (msg.find("revoked") != std::string::npos) {
-                throw;
-            }
-            // Otherwise, it's "No intermediate certificate embedded" or "Expected exactly 1"
-            // GetVerifiedManifest will handle validation (cert is likely invalid anyway)
-        }
-    }
+    // Step 2: Extract manifest (already verified during load)
+    auto manifest = verified_cert.GetManifest();
 
-    // Step 2: Verify certificate chain and extract verified manifest
-    // Certificate uses internally stored intermediates from PEM bundle
-    manifest_data = certificate.GetVerifiedManifest(impl_->backend_ca, trusted_time);
-
-    // Step 3: Parse manifest from verified protobuf
-    auto manifest = Manifest::LoadFromProtobuf(manifest_data);
-
-    // Step 4: Anti-rollback/replay protection
+    // Step 3: Anti-rollback/replay protection
     // SECURITY: Reject if version <= last installed (prevents both rollback AND replay)
     if (impl_->last_installed_version > 0) {
         uint64_t manifest_version = manifest.GetManifestVersion();
@@ -122,7 +105,7 @@ Manifest ManifestValidator::ValidateCertificate(
         }
     }
 
-    // Step 5: Return verified manifest
+    // Step 4: Return verified manifest
     return manifest;
 }
 

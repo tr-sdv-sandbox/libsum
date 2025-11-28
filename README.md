@@ -159,26 +159,25 @@ Outputs verified, decrypted `firmware.bin`.
 │    "manufacturer": "Acme Corp",         │
 │    "device_type": "ESP32-Gateway",      │
 │    "hardware_version": "v2.1",          │
-│    "manifest_version": 42,              │
-│    "manifest_type": "FULL",             │
-│    "provides": [{                        │
-│      "name": "firmware",                │
-│      "security_version": 15             │
-│    }],                                   │
 │    "requires": [{                        │
 │      "name": "firmware",                │
 │      "min_security_version": 5          │
 │    }]                                    │
 │  }                                       │
-│  ⚠️  Readable without verification       │
-│     (for quick filtering)                │
+│  ⚠️  Cryptographically signed            │
+│     (verified during certificate load)  │
 ├─────────────────────────────────────────┤
 │  Extension #2 (OID 1.3.6.1.3.2) CRITICAL│
 │  Secure Update Manifest (Protobuf):     │
 │  {                                       │
 │    "manifest_version": 42,              │
+│    "type": "FULL",                      │
 │    "artifacts": [{                       │
 │      "name": "application",             │
+│      "type": "firmware",                │
+│      "target_ecu": "primary",           │
+│      "version": "1.0.0",                │
+│      "security_version": 15,            │
 │      "hash_algorithm": "SHA-256",       │
 │      "expected_hash": "...",            │
 │      "signature": "...",                │
@@ -190,7 +189,7 @@ Outputs verified, decrypted `firmware.bin`.
 │      "wrapped_key": "..." (X25519)      │
 │    }]                                    │
 │  }                                       │
-│  ✅ Requires GetVerifiedManifest()       │
+│  ✅ Verified during certificate load     │
 └─────────────────────────────────────────┘
         ↓ Signed by CA private key
    Cryptographic integrity for ALL fields
@@ -228,17 +227,19 @@ Device validates:
   Update cert → Intermediate cert → Root CA (pre-installed)
 ```
 
-### Workshop Filtering (Operational Metadata)
+### Workshop Filtering (Device Requirements)
 
-Certificates contain **operational metadata** for workshop technicians to determine safe upgrade paths **without device private keys**:
+Certificates contain **device requirements** in the DeviceMetadata extension for workshop technicians to determine compatibility:
 
 ```
-Device Metadata (UNVERIFIED, readable without signature check):
+Device Metadata (VERIFIED - signed with certificate):
   ├─ hardware_id, manufacturer, device_type    (device identification)
-  ├─ manifest_version                          (for ordering updates)
-  ├─ manifest_type (FULL or DELTA)             (update type)
-  ├─ provides: [ArtifactInfo]                  (what this update installs)
   └─ requires: [ArtifactConstraint]            (device state requirements)
+
+Manifest (VERIFIED - accessible after certificate verification):
+  ├─ manifest_version                          (for ordering updates)
+  ├─ type (FULL or DELTA)                      (update type)
+  └─ artifacts: [ArtifactInfo]                 (what this update provides)
 ```
 
 **Workshop Use Case:**
@@ -246,16 +247,16 @@ Device Metadata (UNVERIFIED, readable without signature check):
 Device State: firmware@primary security_version=10
 
 USB Stick has:
-  ├─ update_v5.crt:  provides firmware@primary sv=15, requires sv [5,12]
-  └─ update_v6.crt:  provides firmware@primary sv=20, requires sv ≥15
+  ├─ update_v5.crt:  artifacts[firmware@primary sv=15], requires sv [5,12]
+  └─ update_v6.crt:  artifacts[firmware@primary sv=20], requires sv ≥15
 
-Technician determines:
+Technician determines (after verifying certificates):
   1. Device (sv=10) matches update_v5 requirements (10 in [5,12]) → Apply v5
   2. After v5, device (sv=15) matches update_v6 requirements (15≥15) → Apply v6
   3. Cannot skip v5 and jump to v6 (sv=10 < 15)
 ```
 
-**⚠️ Security Note:** Operational metadata is UNVERIFIED. Use for filtering/convenience only. Device MUST validate using verified manifest data (requires private key + CA cert).
+**⚠️ Security Note:** All metadata is cryptographically signed. Certificates must be verified against root CA before extracting metadata or manifest.
 
 ### Content-Addressable Storage
 
@@ -341,27 +342,14 @@ auto device_pubkey = crypto::PublicKey::LoadFromFile("device.pub");
 // Read firmware
 auto firmware = ReadBinaryFile("firmware.bin");
 
-// Create device metadata
+// Create device metadata (device identification + requirements)
 DeviceMetadata device_meta;
 device_meta.hardware_id = "DEVICE-12345";      // Links to device pubkey in DB
 device_meta.manufacturer = "Acme Corp";
 device_meta.device_type = "ESP32-Gateway";
 device_meta.hardware_version = "v2.1";
 
-// Operational metadata (for workshop filtering - UNVERIFIED)
-device_meta.manifest_version = 1;              // For ordering updates
-device_meta.manifest_type = ManifestType::FULL;
-
-// What this update provides (optional - helps workshop determine upgrade path)
-ArtifactInfo provides_info;
-provides_info.name = "firmware";
-provides_info.type = "firmware";
-provides_info.target_ecu = "primary";
-provides_info.security_version = 42;           // What this update installs
-provides_info.version = SemVer{1, 0, 0, "", ""};
-device_meta.provides.push_back(provides_info);
-
-// What device state this update requires (optional)
+// Device state requirements (optional - for compatibility checking)
 ArtifactConstraint requires_constraint;
 requires_constraint.name = "firmware";
 requires_constraint.type = "firmware";
@@ -402,65 +390,104 @@ WriteBinaryFile("firmware.enc", encrypted_firmware);
 ```cpp
 #include "sum/crypto.h"
 #include "sum/manifest.h"
-#include "sum/validator.h"
+#include "sum/client/validator.h"
 
 using namespace sum;
 
-// Load certificate and encrypted firmware
-auto certificate = crypto::Certificate::LoadFromFile("update.crt");
+// Load encrypted firmware
 auto encrypted_firmware = ReadBinaryFile("firmware.enc");
 
-// Step 1: Quick filtering (UNVERIFIED - for performance)
-if (certificate.HasDeviceMetadata()) {
-    auto metadata = certificate.GetDeviceMetadata();
+// Step 1: Load root CA and device key
+auto root_ca = crypto::Certificate::LoadFromFile("ca.crt");
+auto device_key = crypto::PrivateKey::LoadFromFile("device.key");
 
-    // Basic device identification
-    if (metadata.hardware_id != MY_HARDWARE_ID) {
-        return; // Not for this device, skip expensive crypto
-    }
+// Step 2: Load and verify update certificate atomically
+// This performs full chain validation: update → intermediate → root
+auto update_cert = crypto::UpdateCertificate::LoadFromFile(
+    "update.crt",                             // PEM bundle (update + intermediate)
+    root_ca,                                  // Root CA for verification
+    time(nullptr),                            // Trusted time (for expiry check)
+    LoadFromFlash("reject_before", 0)         // Certificate revocation timestamp
+);
+// ✅ Certificate is now VERIFIED - all extensions are cryptographically protected
 
-    // Optional: Check if update is applicable (requires device state)
-    // For example, check if current security version meets requirements
-    // NOTE: This is UNVERIFIED metadata - final validation happens after signature check
-    if (!metadata.requires.empty()) {
-        auto current_sv = LoadFromFlash("current_security_version", 0);
-        for (const auto& constraint : metadata.requires) {
-            if (constraint.name == "firmware" && constraint.target_ecu == "primary") {
-                if (current_sv < constraint.min_security_version) {
-                    LOG("Update requires security_version >= %d, current is %d",
-                        constraint.min_security_version, current_sv);
-                    return; // Skip update, doesn't meet requirements
-                }
+// Step 3: Extract verified device metadata
+auto metadata = update_cert.GetDeviceMetadata();
+if (metadata.hardware_id != MY_HARDWARE_ID) {
+    return; // Not for this device
+}
+
+// Step 4: Check device compatibility (verified metadata)
+if (!metadata.requires.empty()) {
+    auto current_sv = LoadFromFlash("current_security_version", 0);
+    for (const auto& constraint : metadata.requires) {
+        if (constraint.name == "firmware" && constraint.target_ecu == "primary") {
+            if (current_sv < constraint.min_security_version) {
+                LOG("Update requires security_version >= %d, current is %d",
+                    constraint.min_security_version, current_sv);
+                return; // Skip update, doesn't meet requirements
             }
         }
     }
 }
 
-// Step 2: Load device key and CA cert
-auto device_key = crypto::PrivateKey::LoadFromFile("device.key");
-auto ca_cert = crypto::Certificate::LoadFromFile("ca.crt");
-
-// Step 3: Set security policies (anti-rollback + revocation)
-ManifestValidator validator(ca_cert, device_key);
+// Step 5: Create validator with security policies
+ManifestValidator validator(root_ca, device_key);
 validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0));
 validator.SetRejectCertificatesBefore(LoadFromFlash("reject_before", 0));
 
-// Step 4: Validate certificate and extract VERIFIED manifest
-auto manifest = validator.ValidateCertificate(certificate, time(nullptr));
+// Step 6: Validate certificate and extract manifest
+auto manifest = validator.ValidateCertificate(update_cert, time(nullptr));
 // ✅ Throws CryptoError if signature invalid, expired, or policy violated
+// ✅ Enforces anti-rollback/replay protection (version <= last rejected)
 
-// Step 5: Decrypt and verify firmware
-auto aes_key = validator.UnwrapEncryptionKey(manifest);
-auto firmware = validator.DecryptSoftware(encrypted_firmware, aes_key, manifest);
+// Step 7: Unwrap encryption key
+size_t artifact_index = 0;  // First artifact
+auto aes_key = validator.UnwrapEncryptionKey(manifest, artifact_index);
 
-if (!validator.VerifySoftware(firmware, manifest)) {
-    throw std::runtime_error("Firmware verification failed");
+// Step 8: Create streaming decryptor and hasher
+auto decryptor = validator.CreateDecryptor(aes_key, manifest, artifact_index);
+crypto::SHA256::Hasher hasher;
+
+// Step 9: Stream decrypt and hash (process in chunks for large files)
+std::ofstream output("firmware.bin", std::ios::binary);
+constexpr size_t CHUNK_SIZE = 4096;
+size_t offset = 0;
+
+while (offset < encrypted_firmware.size()) {
+    size_t chunk_size = std::min(CHUNK_SIZE, encrypted_firmware.size() - offset);
+    std::vector<uint8_t> encrypted_chunk(
+        encrypted_firmware.begin() + offset,
+        encrypted_firmware.begin() + offset + chunk_size
+    );
+
+    auto decrypted_chunk = decryptor->Update(encrypted_chunk);
+    hasher.Update(decrypted_chunk);
+    output.write(reinterpret_cast<const char*>(decrypted_chunk.data()),
+                 decrypted_chunk.size());
+
+    offset += chunk_size;
 }
 
-// Step 6: Install verified firmware
-InstallFirmware(firmware);
+// Finalize decryption
+auto final_chunk = decryptor->Finalize();
+if (!final_chunk.empty()) {
+    hasher.Update(final_chunk);
+    output.write(reinterpret_cast<const char*>(final_chunk.data()),
+                 final_chunk.size());
+}
+output.close();
 
-// Step 7: Persist new version (anti-rollback)
+// Step 10: Verify hash and signature
+auto computed_hash = hasher.Finalize();
+if (!validator.VerifySignature(computed_hash, manifest, artifact_index)) {
+    throw std::runtime_error("Signature verification failed!");
+}
+
+// Step 11: Install verified firmware
+InstallFirmware("firmware.bin");
+
+// Step 12: Persist new version (anti-rollback/replay protection)
 SaveToFlash("last_version", manifest.GetManifestVersion());
 ```
 
@@ -497,27 +524,37 @@ SaveToFlash("last_version", manifest.GetManifestVersion());
 
 ### Secure-by-Design API
 
-**Impossible to use unverified data:**
+**Atomic Verification - Impossible to bypass:**
 
 ```cpp
-// ❌ Does not exist - cannot load standalone manifests
-Manifest::LoadFromFile("manifest.pb");
+// ❌ Does not exist - cannot load certificate without verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt");
 
-// ✅ ONLY way - must verify certificate
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
-auto manifest = Manifest::LoadFromProtobuf(manifest_data);
+// ✅ ONLY way - verification is atomic with load
+auto cert = UpdateCertificate::LoadFromFile(
+    "update.crt",
+    root_ca,          // Must provide root CA
+    time(nullptr),    // Must provide trusted time
+    reject_before     // Optional: certificate revocation
+);
+// ✅ Certificate is VERIFIED - all extensions are now trusted
 ```
 
-**Clear separation of unverified vs verified:**
+**All data is verified:**
 
 ```cpp
-// UNVERIFIED (for quick filtering, includes operational metadata)
-auto metadata = cert.GetDeviceMetadata();
-// Access: metadata.manifest_version, metadata.provides, metadata.requires
+// Load with atomic verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
 
-// VERIFIED (cryptographically protected, requires signature validation)
-auto manifest = validator.ValidateCertificate(cert);
-auto verified_metadata = cert.GetVerifiedDeviceMetadata(ca_cert, time(nullptr));
+// Extract verified data (no parameters needed - verification already done)
+auto metadata = cert.GetDeviceMetadata();  // ✅ Cryptographically verified
+auto manifest = cert.GetManifest();        // ✅ Cryptographically verified
+
+// Access verified fields
+LOG("Hardware ID: %s", metadata.hardware_id.c_str());
+LOG("Manifest version: %lu", manifest.GetManifestVersion());
+LOG("Manifest type: %s", manifest.GetType() == ManifestType::FULL ? "FULL" : "DELTA");
+LOG("Artifacts: %zu", manifest.GetArtifacts().size());
 ```
 
 ## Command-Line Tools

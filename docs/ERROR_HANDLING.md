@@ -208,12 +208,33 @@ bool Certificate::VerifyChainWithIntermediates(...) {
 ### Application Code
 ```cpp
 try {
-    ManifestValidator validator(root_ca, intermediates, device_key);
-    auto manifest = validator.ValidateCertificate(update_cert);
-    auto key = validator.UnwrapEncryptionKey(manifest);
-    auto software = validator.DecryptSoftware(encrypted, key, manifest);
+    // Load and verify certificate atomically
+    auto root_ca = crypto::Certificate::LoadFromFile("ca.crt");
+    auto update_cert = crypto::UpdateCertificate::LoadFromFile(
+        "update.crt",
+        root_ca,
+        time(nullptr),
+        reject_before
+    );
+    // ✅ Certificate verified - all extensions are trustworthy
 
-    if (!validator.VerifySoftware(software, manifest)) {
+    // Validate and extract manifest
+    ManifestValidator validator(root_ca, device_key);
+    validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0));
+    auto manifest = validator.ValidateCertificate(update_cert, time(nullptr));
+
+    // Unwrap key and create decryptor
+    size_t artifact_index = 0;
+    auto key = validator.UnwrapEncryptionKey(manifest, artifact_index);
+    auto decryptor = validator.CreateDecryptor(key, manifest, artifact_index);
+
+    // Stream decrypt and hash
+    crypto::SHA256::Hasher hasher;
+    // ... (streaming loop)
+    auto computed_hash = hasher.Finalize();
+
+    // Verify signature
+    if (!validator.VerifySignature(computed_hash, manifest, artifact_index)) {
         LOG(ERROR) << "Software verification failed - hash or signature mismatch";
         return 1;
     }

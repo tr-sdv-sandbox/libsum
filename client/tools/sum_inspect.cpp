@@ -167,24 +167,8 @@ void InspectDeviceMetadata(X509* x509) {
             std::cout << "Hardware Version:  " << metadata.hardware_version << "\n";
         }
 
-        // Operational metadata
-        std::cout << "\n--- Operational Metadata (for workshop filtering) ---\n\n";
-        std::cout << "Manifest Version:  " << metadata.manifest_version << "\n";
-        std::cout << "Manifest Type:     " << (metadata.manifest_type == sum::ManifestType::FULL ? "FULL" : "DELTA") << "\n";
-
-        // Provides (what this update installs)
-        if (!metadata.provides.empty()) {
-            std::cout << "\nProvides (" << metadata.provides.size() << " artifact" << (metadata.provides.size() > 1 ? "s" : "") << "):\n";
-            for (size_t i = 0; i < metadata.provides.size(); i++) {
-                const auto& artifact = metadata.provides[i];
-                std::cout << "  [" << (i+1) << "] " << artifact.name << "@" << artifact.target_ecu << "\n";
-                std::cout << "      Type: " << artifact.type << "\n";
-                std::cout << "      Version: " << artifact.version.ToString() << "\n";
-                std::cout << "      Security Version: " << artifact.security_version << "\n";
-            }
-        } else {
-            std::cout << "\nProvides: (none)\n";
-        }
+        // Note: Operational metadata (manifest version, type, artifacts) moved to Manifest
+        // See "Embedded Manifest" section below for this information
 
         // Requires (device state requirements)
         if (!metadata.requires.empty()) {
@@ -243,7 +227,20 @@ void InspectManifest(X509* x509, bool verbose, bool json_output) {
 
         std::cout << "\n--- Manifest Fields ---\n\n";
         std::cout << "Schema version: " << manifest.GetVersion() << "\n";
-        std::cout << "Manifest version (metadata sequence): " << manifest.GetManifestVersion() << "\n";
+        std::cout << "Manifest Version: " << manifest.GetManifestVersion() << "\n";
+
+        // Manifest type
+        auto manifest_type = manifest.GetType();
+        std::cout << "Manifest Type: " << (manifest_type == sum::ManifestType::FULL ? "FULL" : "DELTA") << "\n";
+
+        // Provides summary (derived from artifacts)
+        auto artifacts = manifest.GetArtifacts();
+        std::cout << "Provides (" << artifacts.size() << " artifact" << (artifacts.size() != 1 ? "s" : "") << "):\n";
+        for (const auto& a : artifacts) {
+            std::cout << "  - " << a.name << "@" << a.target_ecu
+                      << " (type: " << a.type << ", version: " << a.version.ToString()
+                      << ", security version: " << a.security_version << ")\n";
+        }
 
         // Signature
         auto signature = manifest.GetSignature();
@@ -261,8 +258,7 @@ void InspectManifest(X509* x509, bool verbose, bool json_output) {
         }
         std::cout << "\n";
 
-        // Artifacts
-        auto artifacts = manifest.GetArtifacts();
+        // Artifacts (detailed view)
         std::cout << "\nArtifacts (" << artifacts.size() << "):\n";
         for (size_t i = 0; i < artifacts.size(); i++) {
             const auto& a = artifacts[i];

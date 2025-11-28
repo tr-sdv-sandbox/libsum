@@ -23,6 +23,7 @@ namespace sum {
 // Forward declarations
 namespace crypto {
     class Certificate;
+    class UpdateCertificate;
     class PrivateKey;
     class PublicKey;
 }
@@ -117,11 +118,19 @@ struct EncryptionParams {
 };
 
 /**
+ * @brief Manifest type (FULL vs PARTIAL/DELTA update)
+ */
+enum class ManifestType {
+    FULL = 0,   ///< Complete system state - all artifacts device should have
+    DELTA = 1   ///< Partial update - only changed artifacts
+};
+
+/**
  * @brief Secure Update Manifest (Protocol Buffer based)
  *
  * Uptane-inspired security model:
- * - Rollback protection via release_counter
- * - Snapshot protection via manifest_hash
+ * - Rollback protection via security_version
+ * - Certificate-based integrity protection via X.509 PKI
  * - Per-device encryption
  * - Flexible artifact routing via type/target_ecu
  * - Deterministic installation order
@@ -200,14 +209,14 @@ public:
     uint64_t GetManifestVersion() const;
 
     /**
-     * @brief Get manifest hash (snapshot protection)
+     * @brief Get manifest type (FULL or PARTIAL/DELTA)
      *
-     * SHA-256 hash of canonical manifest serialization (excluding signature field).
-     * Prevents mix-and-match attacks (Uptane Snapshot role).
+     * Indicates whether this is a complete system state (FULL) or
+     * a partial update containing only changed artifacts (DELTA).
      *
-     * @return Manifest hash (32 bytes, empty if not set)
+     * @return Manifest type
      */
-    const std::vector<uint8_t>& GetManifestHash() const;
+    ManifestType GetType() const;
 
     const std::vector<SoftwareArtifact>& GetArtifacts() const;
     const std::vector<EncryptionParams>& GetEncryptionParams() const;
@@ -243,7 +252,6 @@ public:
     // Mutators (for building manifests)
 
     void SetManifestVersion(uint64_t version);
-    void SetManifestHash(const std::vector<uint8_t>& hash);
     void AddArtifact(SoftwareArtifact artifact);
     void AddEncryptionParams(EncryptionParams params);
     void SetSignature(const std::vector<uint8_t>& signature);
@@ -253,14 +261,6 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
-};
-
-/**
- * @brief Manifest type (FULL vs DELTA update)
- */
-enum class ManifestType {
-    FULL = 0,   ///< Complete system state - all artifacts device should have
-    DELTA = 1   ///< Partial update - only changed artifacts
 };
 
 /**
@@ -310,10 +310,7 @@ struct DeviceMetadata {
     std::string device_type;       ///< Device model/type (e.g., "ESP32-Gateway")
     std::string hardware_version;  ///< Hardware revision (e.g., "v2.1", optional)
 
-    // Operational metadata for workshop/filtering
-    uint64_t manifest_version;           ///< Manifest version (for ordering updates)
-    ManifestType manifest_type;          ///< FULL or DELTA
-    std::vector<ArtifactInfo> provides;  ///< What this update installs
+    // Artifact constraints (what device needs for safe installation)
     std::vector<ArtifactConstraint> requires;  ///< Device state requirements
 
     /**
@@ -332,11 +329,68 @@ struct DeviceMetadata {
 };
 
 /**
- * @brief Create X.509 certificate with embedded manifest and device metadata
+ * @brief Create CA certificate (root or intermediate)
  *
- * Creates a certificate that embeds both:
+ * Creates a Certificate Authority certificate for the 3-tier PKI architecture.
+ * - If issuer_cert is nullptr: creates self-signed root CA
+ * - If issuer_cert is provided: creates intermediate CA signed by issuer
+ *
+ * CA certificates have:
+ * - keyUsage: keyCertSign, cRLSign (critical)
+ * - basicConstraints: CA:TRUE (critical)
+ * - No update-specific extensions (no manifest, no device metadata)
+ *
+ * @param signing_key Private key for signing (for root CA: same as subject key)
+ * @param subject_pubkey Public key for the CA being created
+ * @param subject_name Certificate subject CN (e.g., "Root CA", "Intermediate CA")
+ * @param validity_days Certificate validity period in days (default: 10 years for CA)
+ * @param issuer_cert Optional issuer certificate (nullptr = self-signed root CA)
+ * @return CA certificate
+ */
+crypto::Certificate CreateCACertificate(
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const std::string& subject_name,
+    int validity_days = 3650,
+    const crypto::Certificate* issuer_cert = nullptr
+);
+
+/**
+ * @brief Create end-entity certificate (for testing)
+ *
+ * Creates a simple end-entity certificate without update-specific extensions.
+ * Primarily used for testing certificate chain validation logic.
+ *
+ * For production update certificates with manifest and device metadata,
+ * use CreateUpdateCertificate() instead.
+ *
+ * End-entity certificates have:
+ * - keyUsage: digitalSignature (critical)
+ * - basicConstraints: CA:FALSE (critical)
+ * - No update-specific extensions (no manifest, no device metadata)
+ *
+ * @param signing_key Issuer's private key for signing (typically intermediate CA, or same as subject key for self-signed)
+ * @param subject_pubkey Public key for the end-entity certificate
+ * @param subject_name Certificate subject CN (e.g., "End Entity", "Test Certificate")
+ * @param validity_days Certificate validity period in days (default: 1 year)
+ * @param issuer_cert Optional issuer certificate (CA that signs this certificate, nullptr for self-signed)
+ * @return End-entity certificate
+ */
+crypto::Certificate CreateEndEntityCertificate(
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const std::string& subject_name,
+    int validity_days = 365,
+    const crypto::Certificate* issuer_cert = nullptr
+);
+
+/**
+ * @brief Create update certificate with embedded manifest and device metadata
+ *
+ * Creates an UpdateCertificate (3-tier PKI) that embeds:
  * - Device metadata (readable without keys) - allows quick filtering
  * - Secure update manifest (signed, contains encrypted content)
+ * - Intermediate CA certificate for chain verification
  *
  * The hardware_id in device_metadata must match the device's public key
  * in the backend database. This is how the backend knows which public key
@@ -344,21 +398,50 @@ struct DeviceMetadata {
  *
  * This enables offline distribution: the certificate is the only file needed.
  *
+ * Opinionated: This ALWAYS creates an update certificate with intermediate CA.
+ * The intermediate_cert parameter is required and must not be self-signed.
+ *
  * @param manifest Manifest to embed in certificate
- * @param signing_key Private key to sign certificate
- * @param subject_pubkey Public key for certificate subject
+ * @param signing_key Intermediate CA private key for signing
+ * @param subject_pubkey Device public key for certificate subject
  * @param device_metadata Device identification (hardware_id is REQUIRED)
+ * @param intermediate_cert Intermediate CA certificate (REQUIRED, must not be self-signed)
  * @param subject_name Certificate subject CN
  * @param validity_days Certificate validity in days
- * @param issuer_cert Optional issuer certificate (for proper DN chain). If nullptr, creates self-signed cert.
- * @return Certificate with embedded manifest and device metadata extensions
+ * @return UpdateCertificate with embedded manifest, metadata, and intermediate
+ * @throws CryptoError if intermediate_cert is self-signed
+ */
+crypto::UpdateCertificate CreateUpdateCertificate(
+    const Manifest& manifest,
+    const crypto::PrivateKey& signing_key,
+    const crypto::PublicKey& subject_pubkey,
+    const DeviceMetadata& device_metadata,
+    const crypto::Certificate& intermediate_cert,
+    const std::string& subject_name = "Secure Update Manifest",
+    int validity_days = 365
+);
+
+/**
+ * @brief Create certificate with embedded manifest (legacy/testing API)
+ *
+ * This is a lower-level API primarily used for testing. For production use,
+ * prefer CreateCACertificate for CA certs or CreateUpdateCertificate for update certs.
+ *
+ * @param manifest Manifest to embed
+ * @param signing_key Private key for signing
+ * @param subject_pubkey Subject public key
+ * @param device_metadata Device metadata
+ * @param subject_name Certificate subject name
+ * @param validity_days Validity period in days (default: 365)
+ * @param issuer_cert Issuer certificate (nullptr for self-signed)
+ * @return Certificate with embedded manifest and metadata
  */
 crypto::Certificate CreateCertificateWithManifest(
     const Manifest& manifest,
     const crypto::PrivateKey& signing_key,
     const crypto::PublicKey& subject_pubkey,
     const DeviceMetadata& device_metadata,
-    const std::string& subject_name = "Secure Update Manifest",
+    const std::string& subject_name = "Test Certificate",
     int validity_days = 365,
     const crypto::Certificate* issuer_cert = nullptr
 );

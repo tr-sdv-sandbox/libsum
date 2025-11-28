@@ -10,47 +10,8 @@
 #include "sum/backend/manifest_builder.h"
 #include "sum/common/crypto.h"
 #include "sum/common/manifest.h"
-#include <openssl/x509.h>
-#include <openssl/obj_mac.h>
 
 using namespace sum;
-
-// OID for manifest extension (same as in x509_extension.cpp)
-#define MANIFEST_EXTENSION_OID "1.3.6.1.3.2"
-
-// Helper to extract manifest from X.509 certificate extension
-static std::vector<uint8_t> ExtractManifestFromCertificate(const crypto::Certificate& cert) {
-    // Get DER representation
-    auto der = cert.ToDER();
-
-    // Parse X.509 structure
-    const unsigned char* der_ptr = der.data();
-    X509* x509 = d2i_X509(nullptr, &der_ptr, der.size());
-    if (!x509) {
-        throw std::runtime_error("Failed to parse X.509 certificate");
-    }
-
-    // Find manifest extension
-    ASN1_OBJECT* manifest_oid = OBJ_txt2obj(MANIFEST_EXTENSION_OID, 1);
-    int ext_idx = X509_get_ext_by_OBJ(x509, manifest_oid, -1);
-    ASN1_OBJECT_free(manifest_oid);
-
-    if (ext_idx < 0) {
-        X509_free(x509);
-        throw std::runtime_error("Manifest extension not found in certificate");
-    }
-
-    X509_EXTENSION* ext = X509_get_ext(x509, ext_idx);
-    ASN1_OCTET_STRING* ext_data = X509_EXTENSION_get_data(ext);
-
-    std::vector<uint8_t> manifest_data(
-        ASN1_STRING_get0_data(ext_data),
-        ASN1_STRING_get0_data(ext_data) + ASN1_STRING_length(ext_data)
-    );
-
-    X509_free(x509);
-    return manifest_data;
-}
 
 class ManifestBuilderTest : public ::testing::Test {
 protected:
@@ -59,21 +20,11 @@ protected:
         root_key_ = crypto::PrivateKey::Generate(crypto::KeyType::Ed25519);
 
         // Create self-signed root CA
-        DeviceMetadata root_metadata;
-        root_metadata.hardware_id = "TEST-ROOT-CA";
-        root_metadata.manufacturer = "Test Manufacturer";
-        root_metadata.device_type = "Root-CA";
-
-        Manifest root_manifest;
-        root_manifest.SetManifestVersion(1);
-        root_cert_ = CreateCertificateWithManifest(
-            root_manifest,
+        root_cert_ = CreateCACertificate(
             root_key_,
             crypto::PublicKey::FromPrivateKey(root_key_),
-            root_metadata,
             "Test Root CA",
-            3650,
-            nullptr  // self-signed
+            3650  // 10 years
         );
 
         // Generate Intermediate CA key pair
@@ -81,20 +32,11 @@ protected:
         auto intermediate_pubkey = crypto::PublicKey::FromPrivateKey(intermediate_key_);
 
         // Create intermediate CA (signed by root)
-        DeviceMetadata intermediate_metadata;
-        intermediate_metadata.hardware_id = "TEST-INTERMEDIATE-CA";
-        intermediate_metadata.manufacturer = "Test Manufacturer";
-        intermediate_metadata.device_type = "Intermediate-CA";
-
-        Manifest intermediate_manifest;
-        intermediate_manifest.SetManifestVersion(1);
-        intermediate_cert_ = CreateCertificateWithManifest(
-            intermediate_manifest,
+        intermediate_cert_ = CreateCACertificate(
             root_key_,
             intermediate_pubkey,
-            intermediate_metadata,
             "Test Intermediate CA",
-            1825,
+            1825,  // 5 years
             &root_cert_
         );
 
@@ -215,16 +157,16 @@ TEST_F(ManifestBuilderTest, ManifestHasAllRequiredFields) {
         .SetType("firmware")
         .SetInstallOrder(0);
 
-    auto [cert, encrypted_files] = builder.BuildCertificate(
+    auto [cert_unverified, encrypted_files] = builder.BuildCertificate(
         device_pubkey_, device_metadata_, 1, 365
     );
 
-    // Extract manifest from certificate
-    auto manifest_data = ExtractManifestFromCertificate(cert);
-    EXPECT_FALSE(manifest_data.empty());
+    // Serialize and reload with verification (tests real workflow)
+    std::string pem = cert_unverified.ToPEM();
+    auto cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert_, time(nullptr));
 
-    // Parse manifest
-    Manifest manifest = Manifest::LoadFromProtobuf(manifest_data);
+    // Extract manifest (already verified at load time)
+    Manifest manifest = cert.GetManifest();
 
     // Verify critical fields
     EXPECT_EQ(manifest.GetManifestVersion(), 1);
@@ -257,13 +199,16 @@ TEST_F(ManifestBuilderTest, ManifestCanRoundTripThroughProtobuf) {
     ManifestBuilder builder(intermediate_key_, intermediate_cert_);
     builder.AddArtifact("app", encrypted).SetType("firmware");
 
-    auto [cert, encrypted_files] = builder.BuildCertificate(
+    auto [cert_unverified, encrypted_files] = builder.BuildCertificate(
         device_pubkey_, device_metadata_, 42, 365
     );
 
-    // Extract and parse manifest
-    auto manifest_data = ExtractManifestFromCertificate(cert);
-    Manifest manifest = Manifest::LoadFromProtobuf(manifest_data);
+    // Serialize and reload with verification
+    std::string pem = cert_unverified.ToPEM();
+    auto cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert_, time(nullptr));
+
+    // Extract manifest (already verified)
+    Manifest manifest = cert.GetManifest();
 
     // Re-serialize
     auto re_serialized = manifest.ToProtobuf();
@@ -315,12 +260,15 @@ TEST_F(ManifestBuilderTest, SetManifestMetadata) {
            .AddMetadata("release_notes", "Bug fixes")
            .AddArtifact("fw", encrypted);
 
-    auto [cert, encrypted_files] = builder.BuildCertificate(
+    auto [cert_unverified, encrypted_files] = builder.BuildCertificate(
         device_pubkey_, device_metadata_, 1, 365
     );
 
-    auto manifest_data = ExtractManifestFromCertificate(cert);
-    Manifest manifest = Manifest::LoadFromProtobuf(manifest_data);
+    // Serialize and reload with verification
+    std::string pem = cert_unverified.ToPEM();
+    auto cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert_, time(nullptr));
+
+    Manifest manifest = cert.GetManifest();
 
     EXPECT_EQ(manifest.GetMetadata("vendor").value(), "TestVendor");
     EXPECT_EQ(manifest.GetMetadata("release_notes").value(), "Bug fixes");
@@ -355,51 +303,52 @@ TEST_F(ManifestBuilderTest, DeviceMetadataContainsOperationalFields) {
         .SetInstallOrder(1);
 
     // Build certificate with manifest_version=42
-    auto [cert, encrypted_files] = builder.BuildCertificate(
+    auto [cert_unverified, encrypted_files] = builder.BuildCertificate(
         device_pubkey_, device_metadata_, 42, 365
     );
 
-    // Verify device metadata has operational fields
-    EXPECT_TRUE(cert.HasDeviceMetadata());
-    auto metadata = cert.GetDeviceMetadata(root_cert_, time(nullptr));
+    // Serialize and reload with verification
+    std::string pem = cert_unverified.ToPEM();
+    auto cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert_, time(nullptr));
 
-    // Basic device info
+    // Verify device metadata (device identification only, no operational fields)
+    auto metadata = cert.GetDeviceMetadata();
     EXPECT_EQ(metadata.hardware_id, "TEST-DEVICE-001");
     EXPECT_EQ(metadata.manufacturer, "Test Manufacturer");
     EXPECT_EQ(metadata.device_type, "Test-Device");
     EXPECT_EQ(metadata.hardware_version, "v1.0");
+    EXPECT_TRUE(metadata.requires.empty());  // No constraints implemented yet
 
-    // Operational metadata
-    EXPECT_EQ(metadata.manifest_version, 42);
-    EXPECT_EQ(metadata.manifest_type, ManifestType::FULL);
+    // Operational metadata is now in Manifest, not DeviceMetadata
+    auto manifest = cert.GetManifest();
+    EXPECT_EQ(manifest.GetManifestVersion(), 42);
+    EXPECT_EQ(manifest.GetType(), ManifestType::FULL);
 
-    // Verify provides array matches artifacts
-    ASSERT_EQ(metadata.provides.size(), 2);
+    // Verify artifacts (what this update provides)
+    const auto& artifacts = manifest.GetArtifacts();
+    ASSERT_EQ(artifacts.size(), 2);
 
-    // Check bootloader
-    const auto& bootloader_info = metadata.provides[0];
-    EXPECT_EQ(bootloader_info.name, "bootloader");
-    EXPECT_EQ(bootloader_info.type, "bootloader");
-    EXPECT_EQ(bootloader_info.target_ecu, "primary");
-    EXPECT_EQ(bootloader_info.security_version, 5);
-    EXPECT_EQ(bootloader_info.version.major, 1);
-    EXPECT_EQ(bootloader_info.version.minor, 0);
-    EXPECT_EQ(bootloader_info.version.patch, 0);
+    // Check bootloader artifact
+    const auto& bootloader_artifact = artifacts[0];
+    EXPECT_EQ(bootloader_artifact.name, "bootloader");
+    EXPECT_EQ(bootloader_artifact.type, "bootloader");
+    EXPECT_EQ(bootloader_artifact.target_ecu, "primary");
+    EXPECT_EQ(bootloader_artifact.security_version, 5);
+    EXPECT_EQ(bootloader_artifact.version.major, 1);
+    EXPECT_EQ(bootloader_artifact.version.minor, 0);
+    EXPECT_EQ(bootloader_artifact.version.patch, 0);
 
-    // Check firmware
-    const auto& firmware_info = metadata.provides[1];
-    EXPECT_EQ(firmware_info.name, "firmware");
-    EXPECT_EQ(firmware_info.type, "firmware");
-    EXPECT_EQ(firmware_info.target_ecu, "primary");
-    EXPECT_EQ(firmware_info.security_version, 15);
-    EXPECT_EQ(firmware_info.version.major, 2);
-    EXPECT_EQ(firmware_info.version.minor, 3);
-    EXPECT_EQ(firmware_info.version.patch, 1);
-    EXPECT_EQ(firmware_info.version.prerelease, "beta");
-    EXPECT_EQ(firmware_info.version.build_metadata, "git.abc123");
-
-    // Verify requires is empty (no constraints implemented yet)
-    EXPECT_TRUE(metadata.requires.empty());
+    // Check firmware artifact
+    const auto& firmware_artifact = artifacts[1];
+    EXPECT_EQ(firmware_artifact.name, "firmware");
+    EXPECT_EQ(firmware_artifact.type, "firmware");
+    EXPECT_EQ(firmware_artifact.target_ecu, "primary");
+    EXPECT_EQ(firmware_artifact.security_version, 15);
+    EXPECT_EQ(firmware_artifact.version.major, 2);
+    EXPECT_EQ(firmware_artifact.version.minor, 3);
+    EXPECT_EQ(firmware_artifact.version.patch, 1);
+    EXPECT_EQ(firmware_artifact.version.prerelease, "beta");
+    EXPECT_EQ(firmware_artifact.version.build_metadata, "git.abc123");
 }
 
 TEST_F(ManifestBuilderTest, DeviceMetadataRoundTripThroughProtobuf) {
@@ -414,12 +363,16 @@ TEST_F(ManifestBuilderTest, DeviceMetadataRoundTripThroughProtobuf) {
         .SetVersion(SemVer{3, 2, 1, "", ""})
         .SetSecurityVersion(20);
 
-    auto [cert, encrypted_files] = builder.BuildCertificate(
+    auto [cert_unverified, encrypted_files] = builder.BuildCertificate(
         device_pubkey_, device_metadata_, 100, 365
     );
 
+    // Serialize and reload with verification
+    std::string pem = cert_unverified.ToPEM();
+    auto cert = crypto::UpdateCertificate::LoadFromPEM(pem, root_cert_, time(nullptr));
+
     // Extract device metadata
-    auto metadata = cert.GetDeviceMetadata(root_cert_, time(nullptr));
+    auto metadata = cert.GetDeviceMetadata();
 
     // Serialize to protobuf
     auto protobuf_data = metadata.ToProtobuf();
@@ -428,17 +381,10 @@ TEST_F(ManifestBuilderTest, DeviceMetadataRoundTripThroughProtobuf) {
     // Deserialize back
     auto metadata2 = DeviceMetadata::FromProtobuf(protobuf_data);
 
-    // Verify round-trip preserves all fields
+    // Verify round-trip preserves device identification fields
     EXPECT_EQ(metadata2.hardware_id, metadata.hardware_id);
     EXPECT_EQ(metadata2.manufacturer, metadata.manufacturer);
     EXPECT_EQ(metadata2.device_type, metadata.device_type);
     EXPECT_EQ(metadata2.hardware_version, metadata.hardware_version);
-    EXPECT_EQ(metadata2.manifest_version, metadata.manifest_version);
-    EXPECT_EQ(metadata2.manifest_type, metadata.manifest_type);
-    EXPECT_EQ(metadata2.provides.size(), metadata.provides.size());
-
-    if (!metadata2.provides.empty()) {
-        EXPECT_EQ(metadata2.provides[0].name, metadata.provides[0].name);
-        EXPECT_EQ(metadata2.provides[0].security_version, metadata.provides[0].security_version);
-    }
+    EXPECT_EQ(metadata2.requires.size(), metadata.requires.size());
 }

@@ -72,18 +72,17 @@ The PEM bundle format follows standard PKI practice (like TLS certificates), all
 │  - manufacturer                         │
 │  - device_type                          │
 │  - hardware_version (optional)          │
-│  - manifest_version (ordering)          │
-│  - manifest_type (FULL/DELTA)           │
-│  - provides (what update installs)      │
 │  - requires (device prerequisites)      │
-│  ⚠️  UNVERIFIED - for filtering only    │
+│  ✅ VERIFIED - signed with certificate  │
 ├─────────────────────────────────────────┤
 │  Custom Extension #2 (CRITICAL):        │
 │  Update Manifest (OID: 1.3.6.1.3.2)     │
+│  - manifest_version (replay protection) │
+│  - type (FULL/DELTA)                    │
 │  - Software artifacts + hashes          │
-│  - ECDSA signatures                     │
-│  - Per-device encrypted keys (ECIES)    │
-│  ✅ VERIFIED - requires GetVerifiedManifest()│
+│  - Ed25519 signatures                   │
+│  - Per-device encrypted keys (X25519)   │
+│  ✅ VERIFIED - accessible after load    │
 └─────────────────────────────────────────┘
          ↓ Verified with CA certificate
     Cryptographic Guarantee:
@@ -103,12 +102,9 @@ The PEM bundle format follows standard PKI practice (like TLS certificates), all
 
 2. Create Device Metadata
    ├─ hardware_id: CRITICAL - links to device public key in database
-   ├─ manufacturer, device_type: for quick filtering
+   ├─ manufacturer, device_type: for device identification
    ├─ hardware_version (optional)
-   ├─ manifest_version: for ordering updates
-   ├─ manifest_type: FULL or DELTA
-   ├─ provides: what artifacts this update installs (operational metadata)
-   └─ requires: device prerequisites for this update (operational metadata)
+   └─ requires: device prerequisites for this update (compatibility checking)
 
 3. CreateCertificateWithManifest()
    ├─ Embed manifest as X.509 extension
@@ -124,31 +120,37 @@ The PEM bundle format follows standard PKI practice (like TLS certificates), all
 #### Runtime (Device/Client)
 
 ```
-1. Load certificate from file
-   Certificate cert = Certificate::LoadFromFile("update.crt");
+1. Load and verify certificate atomically
+   auto root_ca = Certificate::LoadFromFile("ca.crt");
+   auto update_cert = UpdateCertificate::LoadFromFile(
+       "update.crt",              // PEM bundle (update + intermediate)
+       root_ca,                   // Root CA for verification
+       time(nullptr),             // Trusted time
+       reject_before              // Certificate revocation timestamp
+   );
+   ✅ Atomic verification - certificate validated during load
+   ✅ Full chain validation: update → intermediate → root
+   ✅ Throws CryptoError if tampered or expired
 
-2. Quick filtering (UNVERIFIED)
-   auto metadata = cert.ExtractDeviceMetadata();
-   if (metadata["hardware_id"] != MY_HARDWARE_ID) {
+2. Extract verified metadata
+   auto metadata = update_cert.GetDeviceMetadata();
+   if (metadata.hardware_id != MY_HARDWARE_ID) {
        return; // Not for this device
    }
 
-3. Verify and extract manifest (VERIFIED)
-   auto manifest_data = cert.GetVerifiedManifest(ca_cert, trusted_time);
-   ✅ Signature verification REQUIRED
-   ✅ Throws CryptoError if tampered
-   ✅ Checks certificate expiration if trusted_time provided
+3. Validate and extract manifest
+   ManifestValidator validator(root_ca, device_key);
+   validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0));
+   auto manifest = validator.ValidateCertificate(update_cert, time(nullptr));
+   ✅ Anti-rollback/replay protection enforced
 
-4. Parse manifest
-   Manifest manifest = Manifest::LoadFromProtobuf(manifest_data);
-
-5. For each encrypted artifact:
-   ├─ Unwrap AES key using device ECIES private key
-   ├─ Decrypt artifact with AES-128-CTR
+4. For each encrypted artifact:
+   ├─ Unwrap AES key using device X25519 private key
+   ├─ Decrypt artifact with AES-128-GCM (streaming)
    ├─ Verify SHA-256 hash
-   └─ Verify ECDSA signature
+   └─ Verify Ed25519 signature
 
-6. Apply update atomically
+5. Apply update atomically
 ```
 
 ---
@@ -300,17 +302,23 @@ When creating updates, backend:
 
 ## Security-by-Design Features
 
-### 1. Impossible to Use Unverified Data
+### 1. Atomic Verification - Impossible to Bypass
 
-The API makes it **impossible** to access manifest data without verification:
+The API makes it **impossible** to load certificates without verification:
 
 ```cpp
-// ❌ This won't compile - no unverified manifest access
-auto manifest_data = cert.ExtractManifestExtension(); // Does not exist!
+// ❌ Cannot load certificate without verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt");  // Does not exist!
 
-// ✅ ONLY way to access manifest - MUST verify
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
+// ✅ ONLY way - verification is atomic with load
+auto cert = UpdateCertificate::LoadFromFile(
+    "update.crt",
+    root_ca,           // MUST provide root CA
+    time(nullptr),     // MUST provide trusted time
+    reject_before      // Optional revocation timestamp
+);
 // Throws CryptoError if signature invalid or certificate expired
+// ✅ Certificate is now VERIFIED - all extensions are trustworthy
 ```
 
 ### 2. Certificate-Only Distribution
@@ -323,8 +331,9 @@ Manifest::LoadFromFile("manifest.pb");  // Does not exist
 Manifest::SaveToFile("manifest.pb");    // Does not exist
 
 // ✅ ONLY format: Certificate-embedded manifests
-auto cert = Certificate::LoadFromFile("update.crt");
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
+auto manifest = cert.GetManifest();  // Already verified during load
+auto metadata = cert.GetDeviceMetadata();  // Already verified during load
 ```
 
 This ensures every update goes through the same verified path, whether delivered:
@@ -337,16 +346,20 @@ Both custom extensions are marked **CRITICAL** in X.509:
 - Clients that don't understand libsum extensions will reject certificates
 - Prevents accidental trust by generic X.509 validators
 
-### 4. Clear Separation: Unverified vs Verified
+### 4. All Data is Verified
 
 ```cpp
-// UNVERIFIED (for quick filtering before expensive crypto)
-auto metadata = cert.ExtractDeviceMetadata();
-if (metadata["hardware_id"] != MY_ID) return;
+// Load with atomic verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
 
-// VERIFIED (cryptographically protected)
-auto manifest = cert.GetVerifiedManifest(ca_cert);
-auto verified_metadata = cert.GetVerifiedDeviceMetadata(ca_cert);
+// All extracted data is cryptographically verified
+auto metadata = cert.GetDeviceMetadata();  // ✅ Signed with certificate
+auto manifest = cert.GetManifest();         // ✅ Signed with certificate
+
+// Access verified fields
+if (metadata.hardware_id != MY_ID) return;
+LOG("Manifest version: %lu", manifest.GetManifestVersion());
+LOG("Manifest type: %s", manifest.GetType() == ManifestType::FULL ? "FULL" : "DELTA");
 ```
 
 ### 5. Detailed Error Messages
@@ -423,10 +436,16 @@ Verification failures provide specific error messages:
    - Or encrypted flash with hardware-backed keys
    - **NEVER** extract private key from device
 
-3. **Trusted Time Source**
-   - Use hardware RTC with battery backup
-   - Or secure NTP with authenticated timestamps
-   - Check certificate expiration: `cert.GetVerifiedManifest(ca_cert, trusted_time)`
+3. **Trusted Time Source** ⚠️ **SECURITY CRITICAL**
+   - Time validation is **REQUIRED** for certificate verification
+   - Skipping time validation completely undermines security
+   - Recommended options (in order of preference):
+     1. **Battery-backed RTC** (best for offline/IoT devices)
+     2. **Roughtime Protocol** (RFC 9507, cryptographically secure network time)
+     3. **GPS Time** (only if GPS spoofing is not in threat model)
+     4. **Hybrid approach**: Roughtime + RTC fallback
+   - Certificate expiration checked during load: `UpdateCertificate::LoadFromFile(..., root_ca, trusted_time)`
+   - **See [TIME_SOURCES.md](TIME_SOURCES.md) for comprehensive guide**
 
 4. **Rollback & Replay Protection**
    - Load persisted version on boot:
@@ -470,8 +489,9 @@ Both use the same certificate format and verification path:
 download_file("https://updates.example.com/device123.crt", "update.crt");
 
 // Verify and install (same code as offline!)
-auto cert = Certificate::LoadFromFile("update.crt");
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
+auto root_ca = Certificate::LoadFromFile("ca.crt");
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
+auto manifest = cert.GetManifest();
 ```
 
 **Offline Workshop**:
@@ -480,8 +500,9 @@ auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
 copy_file("/media/usb/updates/device123.crt", "update.crt");
 
 // Verify and install (same code as online!)
-auto cert = Certificate::LoadFromFile("update.crt");
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
+auto root_ca = Certificate::LoadFromFile("ca.crt");
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
+auto manifest = cert.GetManifest();
 ```
 
 The key advantage: **Offline distribution is just as secure as online** because the certificate is self-contained and cryptographically verified.
@@ -538,7 +559,7 @@ libsum includes comprehensive security tests:
 
 1. **Tampering Detection** (`RejectTamperedManifest`, `RejectTamperedDeviceMetadata`)
    - Verifies that tampering with certificate extensions is detected
-   - Confirms `GetVerifiedManifest()` throws on invalid signatures
+   - Confirms `LoadFromFile()` throws on invalid signatures
 
 2. **CA Verification** (`ProperCAHierarchyVerification`)
    - Tests that updates signed by wrong CA are rejected

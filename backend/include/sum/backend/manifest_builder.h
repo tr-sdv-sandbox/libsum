@@ -222,18 +222,18 @@ public:
     );
 
     /**
-     * @brief Build and package manifest into X.509 certificate
+     * @brief Build and package manifest into update certificate (3-tier PKI)
      *
      * Wraps all artifact AES keys for the target device's public key
-     * and embeds manifest in certificate.
+     * and embeds manifest in UpdateCertificate with intermediate CA.
      *
      * @param device_pubkey Device's public key for certificate subject and key wrapping
      * @param device_metadata Device identification (hardware_id is REQUIRED)
      * @param manifest_version Metadata sequence number (monotonic, for ordering/replay protection)
      * @param validity_days Certificate validity in days
-     * @return Pair of (certificate, map of artifact_name -> encrypted_data)
+     * @return Pair of (UpdateCertificate, map of artifact_name -> encrypted_data)
      */
-    std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>> BuildCertificate(
+    std::pair<crypto::UpdateCertificate, std::map<std::string, std::vector<uint8_t>>> BuildCertificate(
         const crypto::PublicKey& device_pubkey,
         const DeviceMetadata& device_metadata,
         uint64_t manifest_version,

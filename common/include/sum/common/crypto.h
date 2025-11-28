@@ -20,6 +20,7 @@ namespace sum {
 
 // Forward declarations
 struct DeviceMetadata;
+class Manifest;
 class ManifestBuilder;
 
 namespace crypto {
@@ -46,6 +47,16 @@ class KeyUnwrapError : public CryptoError {
 public:
     KeyUnwrapError() : CryptoError("Key unwrapping failed") {}
 };
+
+/**
+ * @brief X.509 Extension OIDs for libsum
+ *
+ * Base OID: 1.3.6.1.3 (reserved for experimental use per RFC 5612)
+ */
+namespace oid {
+    constexpr const char* DEVICE_METADATA = "1.3.6.1.3.1";  ///< Device metadata extension
+    constexpr const char* MANIFEST = "1.3.6.1.3.2";         ///< Update manifest extension
+}
 
 /**
  * @brief Cryptographic size constants
@@ -228,6 +239,12 @@ public:
     std::string ToPEM() const;
 
     /**
+     * @brief Create a deep copy of this certificate
+     * @return Cloned certificate
+     */
+    Certificate Clone() const;
+
+    /**
      * @brief Get public key from certificate
      * @return Public key
      */
@@ -262,55 +279,19 @@ public:
     ) const;
 
     /**
-     * @brief Check if certificate has embedded manifest extension
-     * @return true if manifest extension is present
+     * @brief Check if certificate has a specific X.509 extension
+     * @param oid Extension OID (e.g., "1.3.6.1.3.2")
+     * @return true if extension is present
      */
-    bool HasManifestExtension() const;
+    bool HasExtension(const std::string& oid) const;
 
     /**
-     * @brief Alias for HasManifestExtension()
-     * @return true if manifest extension is present
+     * @brief Get X.509 extension data
+     * @param oid Extension OID (e.g., "1.3.6.1.3.2")
+     * @return Extension data (raw bytes from ASN.1 OCTET STRING)
+     * @throws CryptoError if extension not found
      */
-    inline bool HasManifest() const { return HasManifestExtension(); }
-
-    /**
-     * @brief Extract and verify manifest from certificate X.509 extension
-     *
-     * This method REQUIRES certificate verification before extraction.
-     * It ensures the manifest data has not been tampered with.
-     *
-     * @param ca_cert CA certificate to verify against
-     * @param trusted_time Trusted timestamp for validity check (Unix epoch seconds, REQUIRED - use time(nullptr) for current time)
-     * @return Verified manifest data (Protocol Buffer format)
-     * @throws CryptoError if no manifest extension present
-     * @throws CryptoError if certificate verification fails
-     */
-    std::vector<uint8_t> GetVerifiedManifest(const Certificate& root_ca, int64_t trusted_time) const;
-
-    /**
-     * @brief Check if certificate has embedded device metadata extension
-     * @return true if device metadata extension is present
-     */
-    bool HasDeviceMetadata() const;
-
-    /**
-     * @brief Get and verify device metadata from certificate X.509 extension
-     *
-     * This method verifies the entire certificate chain before extracting metadata,
-     * ensuring the data is cryptographically authenticated.
-     *
-     * The certificate must have been loaded from a PEM bundle (via LoadFromFile),
-     * which automatically stores intermediate certificates internally.
-     *
-     * Certificate chain: this cert → internal intermediates → root CA
-     *
-     * @param root_ca Root CA certificate (trust anchor, pre-installed on device)
-     * @param trusted_time Trusted timestamp for validity check (Unix epoch seconds, REQUIRED - use time(nullptr) for current time)
-     * @return Verified device metadata
-     * @throws CryptoError if no device metadata extension present
-     * @throws CryptoError if certificate chain verification fails
-     */
-    DeviceMetadata GetDeviceMetadata(const Certificate& root_ca, int64_t trusted_time) const;
+    std::vector<uint8_t> GetExtension(const std::string& oid) const;
 
     /**
      * @brief Get certificate notBefore timestamp (for revocation checking)
@@ -318,13 +299,6 @@ public:
      * @throws CryptoError if certificate is invalid
      */
     int64_t GetNotBefore() const;
-
-    /**
-     * @brief Get embedded intermediate certificate issuance time
-     * @return Unix epoch seconds when intermediate certificate was issued (notBefore)
-     * @throws CryptoError if no intermediate certificate is embedded
-     */
-    int64_t GetIntermediateIssuanceTime() const;
 
     /**
      * @brief Get certificate subject distinguished name
@@ -343,17 +317,6 @@ public:
      * @return Pair of (notBefore, notAfter) timestamps in Unix epoch seconds
      */
     std::pair<int64_t, int64_t> GetValidityPeriod() const;
-
-    /**
-     * @brief Extract manifest from certificate X.509 extension (UNVERIFIED)
-     *
-     * WARNING: This returns unverified manifest data.
-     * Use GetVerifiedManifest() for production.
-     *
-     * @return Manifest data (Protocol Buffer format, UNVERIFIED)
-     * @throws CryptoError if no manifest extension present
-     */
-    std::vector<uint8_t> ExtractManifest() const;
 
     /**
      * @brief Verify certificate signature with public key
@@ -378,6 +341,137 @@ public:
      * @param intermediate_cert Intermediate certificate to add
      */
     void AddIntermediate(const Certificate& intermediate_cert);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/**
+ * @brief Opinionated update certificate with 3-tier PKI enforcement
+ *
+ * This class represents an update certificate bundled with its intermediate CA,
+ * enforcing the opinionated 3-tier PKI architecture:
+ * Root CA → Intermediate CA → Update Certificate
+ *
+ * UpdateCertificate guarantees:
+ * - Always has exactly 1 intermediate CA embedded
+ * - Chain verification is always 3-tier
+ * - Contains update-specific extensions (manifest, device metadata)
+ * - Provides type-safe access to verified update data
+ */
+class UpdateCertificate {
+public:
+    UpdateCertificate();
+    ~UpdateCertificate();
+
+    UpdateCertificate(UpdateCertificate&&) noexcept;
+    UpdateCertificate& operator=(UpdateCertificate&&) noexcept;
+    UpdateCertificate(const UpdateCertificate&) = delete;
+    UpdateCertificate& operator=(const UpdateCertificate&) = delete;
+
+    /**
+     * @brief Load and verify update certificate from PEM file (2-cert bundle required)
+     *
+     * Performs complete atomic verification:
+     * - Parses PEM file containing exactly 2 certificates (update cert + intermediate CA)
+     * - Verifies cryptographic chain: update cert → intermediate CA → root CA
+     * - Validates timestamp: all certificates must be valid at trusted_time
+     * - Checks revocation: rejects if intermediate issued before reject_certs_before
+     *
+     * SECURITY: Cannot construct unverified UpdateCertificate - verification is mandatory.
+     *
+     * @param path Path to certificate bundle file (PEM format)
+     * @param root_ca Root CA certificate (trust anchor)
+     * @param trusted_time Trusted timestamp for validity check (Unix epoch seconds)
+     * @param reject_certs_before Reject intermediate CAs issued before this time (0 = no limit)
+     * @return Verified update certificate with embedded intermediate
+     * @throws CryptoError if file doesn't contain exactly 2 certificates
+     * @throws CryptoError if verification fails (signature, timestamp, or revocation)
+     * @throws CryptoError on parse error
+     */
+    static UpdateCertificate LoadFromFile(
+        const std::string& path,
+        const Certificate& root_ca,
+        int64_t trusted_time,
+        int64_t reject_certs_before = 0
+    );
+
+    /**
+     * @brief Load and verify update certificate from PEM string (2-cert bundle required)
+     *
+     * Performs complete atomic verification:
+     * - Parses PEM string containing exactly 2 certificates (update cert + intermediate CA)
+     * - Verifies cryptographic chain: update cert → intermediate CA → root CA
+     * - Validates timestamp: all certificates must be valid at trusted_time
+     * - Checks revocation: rejects if intermediate issued before reject_certs_before
+     *
+     * SECURITY: Cannot construct unverified UpdateCertificate - verification is mandatory.
+     *
+     * Use this for loading certificates from HTTP responses or in-memory buffers.
+     *
+     * @param pem PEM-encoded 2-cert bundle
+     * @param root_ca Root CA certificate (trust anchor)
+     * @param trusted_time Trusted timestamp for validity check (Unix epoch seconds)
+     * @param reject_certs_before Reject intermediate CAs issued before this time (0 = no limit)
+     * @return Verified update certificate with embedded intermediate
+     * @throws CryptoError if PEM doesn't contain exactly 2 certificates
+     * @throws CryptoError if verification fails (signature, timestamp, or revocation)
+     * @throws CryptoError on parse error
+     */
+    static UpdateCertificate LoadFromPEM(
+        const std::string& pem,
+        const Certificate& root_ca,
+        int64_t trusted_time,
+        int64_t reject_certs_before = 0
+    );
+
+    /**
+     * @brief Create update certificate from separate cert and intermediate (factory helper)
+     *
+     * @internal Used by CreateUpdateCertificate factory function for creating NEW certificates.
+     * This does NOT verify the certificate chain - verification only happens when loading
+     * certificates from untrusted sources (LoadFromPEM/LoadFromFile).
+     *
+     * @param cert Update certificate (with manifest + device metadata extensions)
+     * @param intermediate Intermediate CA certificate
+     * @return Update certificate (unverified - for factory use only)
+     */
+    static UpdateCertificate FromCertificates(Certificate cert, Certificate intermediate);
+
+    /**
+     * @brief Extract manifest from verified update certificate
+     *
+     * Returns the manifest that was verified during load/construction.
+     * SECURITY: Certificate chain was already verified at load time.
+     *
+     * @return Verified manifest
+     * @throws CryptoError if no manifest extension present
+     */
+    Manifest GetManifest() const;
+
+    /**
+     * @brief Extract device metadata from verified update certificate
+     *
+     * Returns the device metadata that was verified during load/construction.
+     * SECURITY: Certificate chain was already verified at load time.
+     *
+     * @return Verified device metadata
+     * @throws CryptoError if no device metadata extension present
+     */
+    DeviceMetadata GetDeviceMetadata() const;
+
+    /**
+     * @brief Get intermediate certificate issuance time
+     * @return Unix epoch seconds when intermediate certificate was issued (notBefore)
+     */
+    int64_t GetIntermediateIssuanceTime() const;
+
+    /**
+     * @brief Export to PEM format (2-cert bundle)
+     * @return PEM-encoded bundle containing update cert + intermediate
+     */
+    std::string ToPEM() const;
 
 private:
     class Impl;

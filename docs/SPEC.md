@@ -31,20 +31,7 @@ message DeviceMetadata {
   string hardware_id = 2;              // "DEVICE-12345"
   string manufacturer = 3;             // "Acme Corp"
   string hardware_version = 4;         // "v2.1" (optional)
-
-  // Operational metadata for workshop/filtering
-  uint64 manifest_version = 5;         // For ordering updates
-  ManifestType manifest_type = 6;      // FULL or DELTA
-  repeated ArtifactInfo provides = 7;  // What this update installs
-  repeated ArtifactConstraint requires = 8;  // Device state requirements
-}
-
-message ArtifactInfo {
-  string name = 1;                // "firmware"
-  string type = 2;                // "firmware"
-  string target_ecu = 3;          // "primary"
-  uint64 security_version = 4;    // 15 (what this update provides)
-  SemVer version = 5;             // "2.0.0" (optional)
+  repeated ArtifactConstraint requires = 5;  // Device state requirements
 }
 
 message ArtifactConstraint {
@@ -57,25 +44,23 @@ message ArtifactConstraint {
 }
 ```
 
-**Purpose**: Quick filtering and workshop upgrade path determination.
+**Purpose**: Device identification and compatibility requirements.
 
-**Security**: UNVERIFIED data, readable without signature verification. Use only for filtering and operational decisions. Device MUST use verified manifest data for security decisions.
+**Security**: Cryptographically signed with certificate. Verified atomically during certificate load. Use `GetDeviceMetadata()` after `UpdateCertificate::LoadFromFile()` to access verified data.
 
 **Workshop Use Case**:
 ```
 Device at: firmware@primary security_version=10
 
-Update A metadata:
-  manifest_version: 5
-  provides: firmware@primary security_version=15
-  requires: firmware@primary min=5, max=12
+Update A (after verification):
+  DeviceMetadata.requires: firmware@primary min=5, max=12
+  Manifest.artifacts[0]: firmware@primary security_version=15
 
-Update B metadata:
-  manifest_version: 6
-  provides: firmware@primary security_version=20
-  requires: firmware@primary min=15
+Update B (after verification):
+  DeviceMetadata.requires: firmware@primary min=15
+  Manifest.artifacts[0]: firmware@primary security_version=20
 
-Workshop decision:
+Workshop decision (after verifying certificates):
   - Device (v10) matches Update A requirements (10 in [5,12]) → Apply A
   - After A, device (v15) matches Update B requirements (15 >= 15) → Apply B
 ```
@@ -86,11 +71,17 @@ Protocol Buffers format (simplified view):
 
 ```protobuf
 message Manifest {
-  uint64 manifest_version = 2;
+  uint64 manifest_version = 2;         // For replay protection
+  ManifestType type = 5;                // FULL or DELTA
   repeated Artifact artifacts = 10;
   repeated EncryptionParams encryption = 12;
   bytes signature = 20;
   bytes signing_cert = 21;
+}
+
+enum ManifestType {
+  FULL = 0;   // Complete system state
+  DELTA = 1;  // Partial update
 }
 
 message Artifact {
@@ -103,6 +94,8 @@ message Artifact {
   string hash_algorithm = 10;
   bytes expected_hash = 11;
   uint64 size = 12;
+  bytes ciphertext_hash = 13;          // SHA-256 of encrypted file (for content-addressable storage)
+  uint64 ciphertext_size = 14;
   string signature_algorithm = 20;
   bytes signature = 21;
   repeated Source sources = 40;
@@ -119,7 +112,7 @@ message EncryptionParams {
 }
 ```
 
-**Security**: Accessible only after certificate signature verification via `GetVerifiedManifest()`.
+**Security**: Cryptographically signed with certificate. Verified atomically during certificate load. Use `GetManifest()` after `UpdateCertificate::LoadFromFile()` to access verified data.
 
 ## Versioning Model
 

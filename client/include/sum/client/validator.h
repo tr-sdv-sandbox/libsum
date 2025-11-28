@@ -93,21 +93,21 @@ public:
      * @brief Validate update certificate and extract manifest (RECOMMENDED)
      *
      * This is the primary API for validating secure updates.
-     * Verifies certificate signature and extracts verified manifest.
+     * Verifies 3-tier certificate chain and extracts verified manifest.
      *
      * Automatically enforces:
-     * - Certificate chain validation
+     * - Certificate chain validation (update cert → intermediate → root CA)
      * - Timestamp validation (expiry)
      * - Anti-rollback (if SetLastInstalledVersion called)
      * - Certificate revocation (if SetRejectCertificatesBefore called)
      *
-     * @param certificate Update certificate containing manifest
+     * @param update_certificate UpdateCertificate bundle (update cert + intermediate)
      * @param trusted_time Trusted timestamp for validity check (Unix epoch seconds, REQUIRED - use time(nullptr) for current time)
      * @return Verified manifest
      * @throws CryptoError if certificate verification fails or security policy violated
      */
     Manifest ValidateCertificate(
-        const crypto::Certificate& certificate,
+        const crypto::UpdateCertificate& update_certificate,
         int64_t trusted_time
     );
 

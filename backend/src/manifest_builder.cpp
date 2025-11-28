@@ -245,7 +245,7 @@ ManifestBuilder::Build(
     return {std::move(manifest), std::move(encrypted_files)};
 }
 
-std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>>
+std::pair<crypto::UpdateCertificate, std::map<std::string, std::vector<uint8_t>>>
 ManifestBuilder::BuildCertificate(
     const crypto::PublicKey& device_pubkey,
     const DeviceMetadata& device_metadata,
@@ -255,34 +255,19 @@ ManifestBuilder::BuildCertificate(
     // Use hardware_id as device_id
     auto [manifest, encrypted_files] = Build(device_metadata.hardware_id, device_pubkey, manifest_version);
 
-    // Populate device metadata with operational fields for workshop filtering
-    DeviceMetadata augmented_metadata = device_metadata;
-    augmented_metadata.manifest_version = manifest_version;
-    augmented_metadata.manifest_type = ManifestType::FULL;  // TODO: Support DELTA when implemented
+    // DeviceMetadata now only contains device identification + requires
+    // (manifest_version, manifest_type, and provides are in Manifest, not DeviceMetadata)
+    // TODO: Populate device_metadata.requires when prerequisites are implemented
 
-    // Populate provides (what this update installs)
-    for (const auto& pending : impl_->artifacts_) {
-        ArtifactInfo info;
-        info.name = pending.name;
-        info.type = pending.type;
-        info.target_ecu = pending.target_ecu;
-        info.security_version = pending.security_version;
-        info.version = pending.version;
-        augmented_metadata.provides.push_back(info);
-    }
-
-    // TODO: Populate requires when prerequisites are implemented
-    // For now, requires is empty (no constraints)
-
-    // CreateCertificateWithManifest automatically embeds intermediate when issuer is not self-signed
-    auto cert = CreateCertificateWithManifest(
+    // CreateUpdateCertificate creates 3-tier PKI with intermediate automatically bundled
+    auto cert = CreateUpdateCertificate(
         manifest,
         impl_->backend_key_,
         device_pubkey,
-        augmented_metadata,
+        device_metadata,
+        impl_->backend_cert_,  // Intermediate CA
         "Secure Update Manifest",
-        validity_days,
-        &impl_->backend_cert_  // Intermediate CA - will be auto-embedded
+        validity_days
     );
 
     return {std::move(cert), std::move(encrypted_files)};
@@ -297,12 +282,8 @@ ManifestBuilder::BuildCertificateChainPEM(
 ) {
     auto [cert, encrypted_files] = BuildCertificate(device_pubkey, device_metadata, manifest_version, validity_days);
 
-    // Convert to PEM and bundle with intermediate cert
-    std::string update_pem = cert.ToPEM();
-    std::string intermediate_pem = impl_->backend_cert_.ToPEM();
-    std::string pem_bundle = update_pem + intermediate_pem;
-
-    return {std::move(pem_bundle), std::move(encrypted_files)};
+    // UpdateCertificate.ToPEM() already returns 2-cert bundle (update cert + intermediate)
+    return {cert.ToPEM(), std::move(encrypted_files)};
 }
 
 // ArtifactBuilder implementation

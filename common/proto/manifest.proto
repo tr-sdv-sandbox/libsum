@@ -6,7 +6,6 @@
  * - Delegation via certificate chains (Root → Intermediate → Update cert)
  * - Per-artifact rollback protection via security_version
  * - Metadata sequencing via manifest_version
- * - Snapshot protection via manifest_hash
  * - Prerequisites for safe migrations (partition layout, schema changes)
  * - Explicit artifact removal (safe-by-default)
  * - FULL vs DELTA manifest support
@@ -74,14 +73,15 @@ message Manifest {
   // Manifest type (FULL or DELTA)
   ManifestType type = 5;
 
-  // Prerequisites (all must be satisfied to install this manifest)
-  // Used for migration safety (e.g., partition layout, schema migrations)
-  // Manifest is rejected if any prerequisite fails
+  // Prerequisites for upgrade path planning (workshop use)
+  // INTENT: Workshop uses this to determine safe upgrade paths for devices
+  // USAGE: Before sending update to device, workshop checks device's current
+  //        artifact versions against these prerequisites to determine if device
+  //        needs intermediate updates first
+  // EXAMPLE: Update requires bootloader v5+, device at v3 → workshop sends v4 first
+  // STATUS: Not yet implemented in workshop (future work)
+  // NOTE: Devices do NOT validate prerequisites - this is workshop-side logic only
   repeated Prerequisite prerequisites = 6;
-
-  // SHA-256 hash of canonical manifest serialization (excluding signature field)
-  // Prevents mix-and-match attacks (Uptane Snapshot role)
-  bytes manifest_hash = 4;
 
   // Software artifacts to install/update
   repeated Artifact artifacts = 10;
@@ -111,24 +111,40 @@ message Manifest {
 }
 
 /**
- * Prerequisite for installing a manifest
- * Ensures device is at correct state before complex migrations
- * (e.g., partition layout changes, database schema migrations, Android upgrades)
+ * Prerequisite for upgrade path planning (workshop use only)
+ *
+ * Workshop uses prerequisites to determine if a device needs intermediate
+ * updates before installing this manifest. Ensures safe migrations for
+ * complex scenarios like partition layout changes, bootloader updates,
+ * or major version jumps.
+ *
+ * WORKSHOP LOGIC (not yet implemented):
+ *   1. Device reports: bootloader v3, app v10
+ *   2. Update X requires: bootloader v5+
+ *   3. Workshop determines: send bootloader v5 update first, then update X
+ *
+ * This prevents scenarios like:
+ *   - Installing app v15 that requires new partition layout before bootloader updated
+ *   - Major version jumps that skip critical migration steps
+ *   - Android-style "you must install v12 before jumping to v14"
+ *
+ * NOTE: Devices do NOT validate prerequisites. Workshop validates before sending update.
  */
 message Prerequisite {
-  // Artifact that must exist with minimum version
+  // Artifact name that must exist (e.g., "bootloader", "partition-manager")
   string artifact_name = 1;
 
-  // Minimum security version required
-  // Device rejects manifest if current artifact has lower security_version
+  // Minimum security version required on device
+  // Workshop checks: device.security_version >= min_security_version
+  // If false, workshop sends intermediate update first
   uint64 min_security_version = 2;
 
   // Optional: Minimum feature version (SemVer)
-  // Device rejects manifest if current artifact version is lower
+  // Workshop checks: device.version >= min_version
   SemVer min_version = 3;
 
   // Human-readable reason (for diagnostics/logging)
-  // Example: "Android 13 requires Android 12 partition layout"
+  // Example: "Requires partition layout v2 (introduced in bootloader v5)"
   string reason = 4;
 }
 
@@ -347,9 +363,9 @@ message ArtifactConstraint {
  * Identifies the device/certificate purpose and hardware requirements.
  * Used for certificate validation and update routing.
  *
- * SECURITY: This data is UNVERIFIED (readable without signature check).
- * Used for filtering and operational decisions only.
- * Device MUST use verified manifest data for security decisions.
+ * SECURITY: This extension is cryptographically signed (part of X.509 certificate).
+ * UpdateCertificate::LoadFromPEM() verifies the signature before allowing access.
+ * Used for device identification and prerequisite checking.
  */
 message DeviceMetadata {
   // Device type/role
@@ -367,24 +383,13 @@ message DeviceMetadata {
   // Examples: "v1.0", "rev-B", "2024"
   string hardware_version = 4;
 
-  // === Operational metadata (for workshop/filtering) ===
-
-  // Manifest version (for ordering updates)
-  // Workshop uses this to sort updates in application sequence
-  // Device MUST use verified manifest.manifest_version for replay protection
-  uint64 manifest_version = 5;
-
-  // Manifest type (FULL or DELTA)
-  // Workshop uses this to determine if device state must be known
-  ManifestType manifest_type = 6;
-
-  // What this update provides (artifacts in manifest)
-  // Workshop uses this to see what will be installed
-  repeated ArtifactInfo provides = 7;
-
   // What this update requires from device
   // Workshop uses this to determine safe upgrade path
   // Example: Update requires firmware v5-12, device at v10 → safe
   //          Update requires firmware v15+, device at v10 → must upgrade first
-  repeated ArtifactConstraint requires = 8;
+  repeated ArtifactConstraint requires = 5;
+
+  // REMOVED: manifest_version (now only in Manifest - avoid duplication)
+  // REMOVED: manifest_type (now only in Manifest - avoid duplication)
+  // REMOVED: provides (derive from Manifest.artifacts - avoid duplication)
 }
