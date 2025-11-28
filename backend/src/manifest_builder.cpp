@@ -7,7 +7,6 @@
  */
 
 #include "sum/backend/manifest_builder.h"
-#include "sum/backend/generator.h"
 #include "sum/common/crypto.h"
 #include "sum/common/limits.h"
 #include <glog/logging.h>
@@ -57,7 +56,10 @@ struct PendingArtifact {
     std::string target_ecu;
     uint32_t install_order;
     std::vector<Source> sources;
-    bool content_addressable;
+
+    // Versioning
+    SemVer version;                  // Feature version
+    uint64_t security_version = 0;   // Security/rollback protection
 };
 
 // ManifestBuilder implementation
@@ -67,14 +69,12 @@ public:
         : backend_key_(backend_key)
         , backend_cert_(backend_cert)
         , manifest_version_(0)
-        , release_counter_(std::nullopt)
     {}
 
     const crypto::PrivateKey& backend_key_;
     const crypto::Certificate& backend_cert_;
     std::vector<PendingArtifact> artifacts_;
     uint64_t manifest_version_;
-    std::optional<uint64_t> release_counter_;
     std::map<std::string, std::string> metadata_;
 };
 
@@ -103,11 +103,6 @@ ManifestBuilder::ArtifactBuilder& ManifestBuilder::AddArtifact(
 
 ManifestBuilder& ManifestBuilder::SetManifestVersion(uint64_t version) {
     impl_->manifest_version_ = version;
-    return *this;
-}
-
-ManifestBuilder& ManifestBuilder::SetReleaseCounter(uint64_t counter) {
-    impl_->release_counter_ = counter;
     return *this;
 }
 
@@ -150,7 +145,8 @@ void ManifestBuilder::FinalizeArtifact(ArtifactBuilder&& artifact) {
     pending.target_ecu = std::move(artifact.target_ecu_);
     pending.install_order = artifact.install_order_;
     pending.sources = std::move(artifact.sources_);
-    pending.content_addressable = artifact.content_addressable_;
+    pending.version = artifact.version_;
+    pending.security_version = artifact.security_version_;
 
     impl_->artifacts_.push_back(std::move(pending));
 }
@@ -159,7 +155,7 @@ std::pair<Manifest, std::map<std::string, std::vector<uint8_t>>>
 ManifestBuilder::Build(
     const std::string& device_id,
     const crypto::PublicKey& device_pubkey,
-    uint64_t version
+    uint64_t manifest_version
 ) {
     // Finalize current artifact if exists
     if (current_artifact_) {
@@ -177,8 +173,7 @@ ManifestBuilder::Build(
     }
 
     Manifest manifest;
-    manifest.SetManifestVersion(version);
-    manifest.SetReleaseCounter(impl_->release_counter_.value_or(version));
+    manifest.SetManifestVersion(manifest_version);
 
     // Add metadata
     for (const auto& [key, value] : impl_->metadata_) {
@@ -187,9 +182,6 @@ ManifestBuilder::Build(
 
     // Map to store encrypted artifacts (reuse pre-encrypted data)
     std::map<std::string, std::vector<uint8_t>> encrypted_files;
-
-    // Create generator for crypto operations (key wrapping and signing)
-    ManifestGenerator generator(impl_->backend_key_, impl_->backend_cert_);
 
     // Process each artifact
     for (const auto& pending : impl_->artifacts_) {
@@ -201,10 +193,14 @@ ManifestBuilder::Build(
         artifact.type = pending.type.empty() ? "firmware" : pending.type;
         artifact.target_ecu = pending.target_ecu.empty() ? "primary" : pending.target_ecu;
         artifact.install_order = pending.install_order;
+
+        // Versioning
+        artifact.version = pending.version;
+        artifact.security_version = pending.security_version;
+
         artifact.hash_algorithm = "SHA-256";
         artifact.signature_algorithm = "Ed25519";
         artifact.sources = pending.sources;
-        artifact.content_addressable = pending.content_addressable;
 
         // Copy pre-calculated hashes and sizes
         artifact.expected_hash = pending.encrypted.plaintext_hash;
@@ -217,7 +213,7 @@ ManifestBuilder::Build(
 
         // Wrap AES key for this specific device
         LOG(INFO) << "  Wrapping key for device: " << device_id;
-        std::vector<uint8_t> wrapped_key = generator.WrapKey(pending.encrypted.aes_key, device_pubkey);
+        std::vector<uint8_t> wrapped_key = crypto::X25519::WrapKey(pending.encrypted.aes_key, device_pubkey);
 
         // Create encryption params
         EncryptionParams enc_params;
@@ -239,32 +235,39 @@ ManifestBuilder::Build(
     // Set signing certificate in manifest (required for verification)
     manifest.SetSigningCertificate(impl_->backend_cert_.ToDER());
 
-    // Sign manifest
-    generator.SignManifest(manifest);
+    // Sign manifest: serialize WITHOUT signature field, then sign and set signature
+    auto manifest_protobuf = manifest.ToProtobufForSigning();
+    auto signature = crypto::Ed25519::Sign(impl_->backend_key_, manifest_protobuf);
+    manifest.SetSignature(signature);
 
     LOG(INFO) << "Manifest built with " << impl_->artifacts_.size() << " artifacts for device: " << device_id;
 
     return {std::move(manifest), std::move(encrypted_files)};
 }
 
-std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>>
+std::pair<crypto::UpdateCertificate, std::map<std::string, std::vector<uint8_t>>>
 ManifestBuilder::BuildCertificate(
     const crypto::PublicKey& device_pubkey,
     const DeviceMetadata& device_metadata,
-    uint64_t version,
+    uint64_t manifest_version,
     int validity_days
 ) {
     // Use hardware_id as device_id
-    auto [manifest, encrypted_files] = Build(device_metadata.hardware_id, device_pubkey, version);
+    auto [manifest, encrypted_files] = Build(device_metadata.hardware_id, device_pubkey, manifest_version);
 
-    auto cert = CreateCertificateWithManifest(
+    // DeviceMetadata now only contains device identification + requires
+    // (manifest_version, manifest_type, and provides are in Manifest, not DeviceMetadata)
+    // TODO: Populate device_metadata.requires when prerequisites are implemented
+
+    // CreateUpdateCertificate creates 3-tier PKI with intermediate automatically bundled
+    auto cert = CreateUpdateCertificate(
         manifest,
         impl_->backend_key_,
         device_pubkey,
         device_metadata,
+        impl_->backend_cert_,  // Intermediate CA
         "Secure Update Manifest",
-        validity_days,
-        &impl_->backend_cert_
+        validity_days
     );
 
     return {std::move(cert), std::move(encrypted_files)};
@@ -274,61 +277,13 @@ std::pair<std::string, std::map<std::string, std::vector<uint8_t>>>
 ManifestBuilder::BuildCertificateChainPEM(
     const crypto::PublicKey& device_pubkey,
     const DeviceMetadata& device_metadata,
-    uint64_t version,
+    uint64_t manifest_version,
     int validity_days
 ) {
-    auto [cert, encrypted_files] = BuildCertificate(device_pubkey, device_metadata, version, validity_days);
+    auto [cert, encrypted_files] = BuildCertificate(device_pubkey, device_metadata, manifest_version, validity_days);
 
-    // Convert to PEM and bundle with intermediate cert
-    std::string update_pem = cert.ToPEM();
-    std::string intermediate_pem = impl_->backend_cert_.ToPEM();
-    std::string pem_bundle = update_pem + intermediate_pem;
-
-    return {std::move(pem_bundle), std::move(encrypted_files)};
-}
-
-// SemVer overloads
-std::pair<crypto::Certificate, std::map<std::string, std::vector<uint8_t>>>
-ManifestBuilder::BuildCertificate(
-    const crypto::PublicKey& device_pubkey,
-    const DeviceMetadata& device_metadata,
-    const SemVer& sw_version,
-    int validity_days
-) {
-    // Build manifest with temporary version (will be replaced with SemVer)
-    auto [manifest, encrypted_files] = Build(device_metadata.hardware_id, device_pubkey, 0);
-
-    // Set semantic version
-    manifest.SetSoftwareVersion(sw_version);
-
-    auto cert = CreateCertificateWithManifest(
-        manifest,
-        impl_->backend_key_,
-        device_pubkey,
-        device_metadata,
-        "Secure Update Manifest",
-        validity_days,
-        &impl_->backend_cert_
-    );
-
-    return {std::move(cert), std::move(encrypted_files)};
-}
-
-std::pair<std::string, std::map<std::string, std::vector<uint8_t>>>
-ManifestBuilder::BuildCertificateChainPEM(
-    const crypto::PublicKey& device_pubkey,
-    const DeviceMetadata& device_metadata,
-    const SemVer& sw_version,
-    int validity_days
-) {
-    auto [cert, encrypted_files] = BuildCertificate(device_pubkey, device_metadata, sw_version, validity_days);
-
-    // Convert to PEM and bundle with intermediate cert
-    std::string update_pem = cert.ToPEM();
-    std::string intermediate_pem = impl_->backend_cert_.ToPEM();
-    std::string pem_bundle = update_pem + intermediate_pem;
-
-    return {std::move(pem_bundle), std::move(encrypted_files)};
+    // UpdateCertificate.ToPEM() already returns 2-cert bundle (update cert + intermediate)
+    return {cert.ToPEM(), std::move(encrypted_files)};
 }
 
 // ArtifactBuilder implementation
@@ -341,7 +296,6 @@ ManifestBuilder::ArtifactBuilder::ArtifactBuilder(
     , name_(name)
     , encrypted_(encrypted)
     , install_order_(0)
-    , content_addressable_(false)
 {}
 
 ManifestBuilder::ArtifactBuilder&
@@ -377,8 +331,14 @@ ManifestBuilder::ArtifactBuilder::AddSource(
 }
 
 ManifestBuilder::ArtifactBuilder&
-ManifestBuilder::ArtifactBuilder::SetContentAddressable(bool enabled) {
-    content_addressable_ = enabled;
+ManifestBuilder::ArtifactBuilder::SetVersion(const SemVer& version) {
+    version_ = version;
+    return *this;
+}
+
+ManifestBuilder::ArtifactBuilder&
+ManifestBuilder::ArtifactBuilder::SetSecurityVersion(uint64_t security_version) {
+    security_version_ = security_version;
     return *this;
 }
 

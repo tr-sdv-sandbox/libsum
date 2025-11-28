@@ -70,72 +70,39 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "=== Device Example: Verifying and Installing Update ===";
         LOG(INFO) << "";
 
-        // Step 1: Load update certificate chain and encrypted firmware
+        // Step 1: Load update certificate and encrypted firmware
         LOG(INFO) << "Step 1: Loading update files...";
-        LOG(INFO) << "  Loading PEM chain from update.crt...";
-        auto cert_chain = crypto::Certificate::LoadChainFromFile("update.crt");
+        LOG(INFO) << "  Loading certificate (PEM bundle with intermediates) from update.crt...";
+        auto update_certificate = crypto::Certificate::LoadFromFile("update.crt");
         auto encrypted_firmware = ReadFile("firmware.enc");
-        LOG(INFO) << "  ✅ Certificate chain loaded (" << cert_chain.size() << " certificates)";
+        LOG(INFO) << "  ✅ Certificate loaded (intermediates embedded internally)";
         LOG(INFO) << "  ✅ Encrypted firmware loaded (" << encrypted_firmware.size() << " bytes)";
         LOG(INFO) << "";
 
-        // Step 2: Quick filtering using UNVERIFIED metadata
-        // This is an optimization to reject wrong updates quickly
-        LOG(INFO) << "Step 2: Quick filtering (UNVERIFIED metadata)...";
-
-        // Extract update certificate (first in chain)
-        const auto& update_certificate = cert_chain[0];
-
-        if (update_certificate.HasDeviceMetadata()) {
-            auto metadata = update_certificate.GetDeviceMetadata();
-
-            LOG(INFO) << "  Hardware ID: " << metadata.hardware_id;
-            LOG(INFO) << "  Manufacturer: " << metadata.manufacturer;
-            LOG(INFO) << "  Device Type: " << metadata.device_type;
-
-            if (metadata.hardware_id != MY_HARDWARE_ID) {
-                LOG(WARNING) << "Update not for this device, skipping";
-                return 0;
-            }
-            LOG(INFO) << "  ✅ Update is for this device";
-        }
-        LOG(INFO) << "";
-
-        // Step 3: Load device credentials and root CA
-        LOG(INFO) << "Step 3: Loading device credentials and root CA...";
+        // Step 2: Load device credentials and root CA
+        LOG(INFO) << "Step 2: Loading device credentials and root CA...";
         auto device_key = crypto::PrivateKey::LoadFromFile("device.key");
         auto root_ca_cert = crypto::Certificate::LoadFromFile("ca.crt");
         LOG(INFO) << "  ✅ Device private key loaded";
         LOG(INFO) << "  ✅ Root CA certificate loaded";
         LOG(INFO) << "";
 
-        // Extract intermediate certificate from chain (cert_chain[1])
-        LOG(INFO) << "Certificate chain from update.crt:";
-        LOG(INFO) << "  [0] Update certificate (leaf)";
-        if (cert_chain.size() > 1) {
-            LOG(INFO) << "  [1] Intermediate CA certificate";
-        }
-        LOG(INFO) << "Will verify: update cert → intermediate CA → root CA";
+        LOG(INFO) << "Certificate chain verification path:";
+        LOG(INFO) << "  Update cert → intermediate CA (embedded) → root CA";
         LOG(INFO) << "";
 
-        // Step 4: Load security policies from persistent storage
-        LOG(INFO) << "Step 4: Loading security policies...";
+        // Step 3: Load security policies from persistent storage
+        LOG(INFO) << "Step 3: Loading security policies...";
         uint64_t last_installed_version = LoadLastInstalledVersion();
         int64_t revocation_timestamp = LoadRevocationTimestamp();
         LOG(INFO) << "  Last installed version: " << last_installed_version;
         LOG(INFO) << "  Revocation timestamp: " << revocation_timestamp << " (0 = disabled)";
         LOG(INFO) << "";
 
-        // Step 5: Configure validator with security policies
-        LOG(INFO) << "Step 5: Configuring validator with security policies...";
+        // Step 4: Configure validator with security policies
+        LOG(INFO) << "Step 4: Configuring validator with security policies...";
 
-        // Build intermediates list from chain (skip first cert, which is the update cert)
-        std::vector<crypto::Certificate> intermediates;
-        for (size_t i = 1; i < cert_chain.size(); ++i) {
-            intermediates.push_back(std::move(cert_chain[i]));
-        }
-
-        ManifestValidator validator(root_ca_cert, intermediates, device_key);
+        ManifestValidator validator(root_ca_cert, device_key);
 
         // SECURITY: Set anti-rollback protection
         // Automatically rejects updates with version <= last_installed_version
@@ -154,8 +121,8 @@ int main(int argc, char* argv[]) {
         }
         LOG(INFO) << "";
 
-        // Step 6: Validate certificate chain and extract VERIFIED manifest
-        LOG(INFO) << "Step 6: Validating certificate chain...";
+        // Step 5: Validate certificate chain and extract VERIFIED manifest
+        LOG(INFO) << "Step 5: Validating certificate chain...";
         LOG(INFO) << "  Verifying: update cert → intermediate CA → root CA";
         LOG(INFO) << "  Enforcing: anti-rollback + revocation policies";
 
@@ -174,15 +141,15 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "  ✅ Manifest extracted and verified";
         LOG(INFO) << "";
 
-        // Step 7: Display update information
-        LOG(INFO) << "Step 7: Update information...";
+        // Step 6: Display update information
+        LOG(INFO) << "Step 6: Update information...";
         uint64_t update_version = manifest.GetManifestVersion();
         LOG(INFO) << "  Update version: " << update_version;
         LOG(INFO) << "  Upgrade: " << last_installed_version << " → " << update_version;
         LOG(INFO) << "";
 
-        // Step 8: Stream decrypt firmware to flash
-        LOG(INFO) << "Step 8: Streaming decryption to flash...";
+        // Step 7: Stream decrypt firmware to flash
+        LOG(INFO) << "Step 7: Streaming decryption to flash...";
         size_t artifact_index = 0;  // Process first artifact
         auto aes_key = validator.UnwrapEncryptionKey(manifest, artifact_index);
 
@@ -230,8 +197,8 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "  ✅ Decrypted " << total_bytes << " bytes to flash";
         LOG(INFO) << "";
 
-        // Step 9: Verify firmware hash and signature
-        LOG(INFO) << "Step 9: Verifying firmware integrity...";
+        // Step 8: Verify firmware hash and signature
+        LOG(INFO) << "Step 8: Verifying firmware integrity...";
         auto computed_hash = hasher.Finalize();
         if (!validator.VerifySignature(computed_hash, manifest, artifact_index)) {
             LOG(ERROR) << "Firmware verification failed!";
@@ -242,8 +209,8 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "  ✅ Firmware signature verified";
         LOG(INFO) << "";
 
-        // Step 10: Commit firmware update and persist new version
-        LOG(INFO) << "Step 10: Committing firmware update...";
+        // Step 9: Commit firmware update and persist new version
+        LOG(INFO) << "Step 9: Committing firmware update...";
         LOG(INFO) << "  In real device: mark flash partition as valid";
 
         // CRITICAL: Persist new version AFTER successful installation

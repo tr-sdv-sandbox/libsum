@@ -4,8 +4,11 @@
  *
  * Uptane-inspired security model for embedded systems:
  * - Delegation via certificate chains (Root → Intermediate → Update cert)
- * - Rollback protection via release_counter
- * - Snapshot protection via manifest_hash
+ * - Per-artifact rollback protection via security_version
+ * - Metadata sequencing via manifest_version
+ * - Prerequisites for safe migrations (partition layout, schema changes)
+ * - Explicit artifact removal (safe-by-default)
+ * - FULL vs DELTA manifest support
  * - Flexible artifact routing via type and target_ecu
  * - Deterministic installation order
  * - Content-addressable storage support
@@ -41,33 +44,56 @@ message SemVer {
   string build_metadata = 5;  // Optional: "20250124", "git.abc123"
 }
 
+/**
+ * Manifest type (FULL vs DELTA update)
+ */
+enum ManifestType {
+  // Complete system state - all artifacts device should have
+  FULL = 0;
+
+  // Partial update - only changed artifacts + optional removals
+  // Artifacts not mentioned are preserved (safe-by-default)
+  DELTA = 1;
+}
+
 message Manifest {
-  // Schema version (currently 1)
+  // Schema version (for protocol evolution)
+  // Used when protobuf format itself changes
   uint32 version = 1;
 
-  // Software version (user-controlled, can skip versions)
-  // Use for display purposes. Use release_counter for rollback protection.
-  // DEPRECATED: Use software_version instead for semantic versioning
+  // Metadata sequence number (GLOBAL monotonic, MUST increment)
+  // Tracks when manifest was issued (Uptane/TUF "version" field)
+  // Used for:
+  //   - Ordering manifests (workshop knows which to apply first)
+  //   - Replay attack prevention (cannot reuse old manifests)
+  //   - Metadata freshness (always increases, even for A/B variants)
+  // Example: 1 → 2 → 3 → 4 (never decreases, never repeats)
   uint64 manifest_version = 2;
 
-  // Monotonic counter (MUST increment, CANNOT skip)
-  // Primary rollback protection mechanism (Uptane-inspired)
-  uint64 release_counter = 3;
+  // Manifest type (FULL or DELTA)
+  ManifestType type = 5;
 
-  // Semantic version of the software being installed
-  // Provides better compatibility tracking than simple manifest_version
-  SemVer software_version = 5;
+  // Prerequisites for upgrade path planning (workshop use)
+  // INTENT: Workshop uses this to determine safe upgrade paths for devices
+  // USAGE: Before sending update to device, workshop checks device's current
+  //        artifact versions against these prerequisites to determine if device
+  //        needs intermediate updates first
+  // EXAMPLE: Update requires bootloader v5+, device at v3 → workshop sends v4 first
+  // STATUS: Not yet implemented in workshop (future work)
+  // NOTE: Devices do NOT validate prerequisites - this is workshop-side logic only
+  repeated Prerequisite prerequisites = 6;
 
-  // SHA-256 hash of canonical manifest serialization (excluding signature field)
-  // Prevents mix-and-match attacks (Uptane Snapshot role)
-  bytes manifest_hash = 4;
-
-  // Software artifacts to install
+  // Software artifacts to install/update
   repeated Artifact artifacts = 10;
+
+  // Artifacts to explicitly remove (DELTA manifests only)
+  // Must uniquely identify artifact by (name, type, target_ecu)
+  // Default: Keep all artifacts not mentioned (safe-by-default)
+  repeated ArtifactIdentifier remove_artifacts = 11;
 
   // Encryption parameters (AES-GCM + X25519 key wrapping)
   // SECURITY: One entry per (artifact, device) pair - mandatory per-device encryption
-  repeated EncryptionParams encryption = 11;
+  repeated EncryptionParams encryption = 12;
 
   // Ed25519 signature over canonical manifest (excluding this field)
   // Signed by the private key corresponding to the certificate's public key
@@ -77,8 +103,66 @@ message Manifest {
   // Used for signature verification on artifacts
   bytes signing_cert = 21;
 
-  // Optional user metadata (e.g., vendor, release notes, etc.)
+  // Optional user metadata (e.g., vendor, release notes, campaign_id, etc.)
   map<string, string> metadata = 30;
+
+  // REMOVED: release_counter (now per-artifact as security_version)
+  // REMOVED: software_version (now per-artifact as version)
+}
+
+/**
+ * Prerequisite for upgrade path planning (workshop use only)
+ *
+ * Workshop uses prerequisites to determine if a device needs intermediate
+ * updates before installing this manifest. Ensures safe migrations for
+ * complex scenarios like partition layout changes, bootloader updates,
+ * or major version jumps.
+ *
+ * WORKSHOP LOGIC (not yet implemented):
+ *   1. Device reports: bootloader v3, app v10
+ *   2. Update X requires: bootloader v5+
+ *   3. Workshop determines: send bootloader v5 update first, then update X
+ *
+ * This prevents scenarios like:
+ *   - Installing app v15 that requires new partition layout before bootloader updated
+ *   - Major version jumps that skip critical migration steps
+ *   - Android-style "you must install v12 before jumping to v14"
+ *
+ * NOTE: Devices do NOT validate prerequisites. Workshop validates before sending update.
+ */
+message Prerequisite {
+  // Artifact name that must exist (e.g., "bootloader", "partition-manager")
+  string artifact_name = 1;
+
+  // Minimum security version required on device
+  // Workshop checks: device.security_version >= min_security_version
+  // If false, workshop sends intermediate update first
+  uint64 min_security_version = 2;
+
+  // Optional: Minimum feature version (SemVer)
+  // Workshop checks: device.version >= min_version
+  SemVer min_version = 3;
+
+  // Human-readable reason (for diagnostics/logging)
+  // Example: "Requires partition layout v2 (introduced in bootloader v5)"
+  string reason = 4;
+}
+
+/**
+ * Uniquely identifies an artifact for removal
+ * Combination of (name, type, target_ecu) forms unique key
+ */
+message ArtifactIdentifier {
+  // Artifact name (required)
+  string name = 1;
+
+  // Artifact type (required)
+  // Examples: "firmware", "bootloader", "filesystem", "container"
+  string type = 2;
+
+  // Target ECU (required)
+  // Examples: "primary", "wifi-coprocessor", "camera"
+  string target_ecu = 3;
 }
 
 /**
@@ -104,6 +188,7 @@ message Source {
  * - type: Identifies artifact purpose (similar to Uptane custom metadata)
  * - target_ecu: Routes to specific component (Uptane ecuIdentifier)
  * - install_order: Deterministic installation sequence
+ * - security_version: Rollback protection (Uptane releaseCounter)
  */
 message Artifact {
   // Unique identifier within this manifest
@@ -115,7 +200,7 @@ message Artifact {
   // Custom types allowed (e.g., "my-company-config")
   string type = 2;
 
-  // Target component/ECU identifier
+  // Target component/ECU identifier (Uptane ecuIdentifier)
   // Examples: "primary", "wifi-coprocessor", "camera", "lidar"
   // Device routes artifact to appropriate component based on this field
   string target_ecu = 3;
@@ -124,6 +209,22 @@ message Artifact {
   // Device MUST process artifacts in ascending order
   // Use case: Install bootloader (order=0) before firmware (order=1)
   uint32 install_order = 4;
+
+  // === Versioning ===
+
+  // Feature version (semantic, can skip/go backwards)
+  // Used for compatibility checking and display
+  // Example: 2.0.0 → 2.1.0-beta → 2.0.0 (A/B test revert)
+  SemVer version = 50;
+
+  // Security version (MONOTONIC per artifact, MUST increment on security changes)
+  // Used for:
+  //   - Rollback protection (cannot install older security versions)
+  //   - CVE constraint enforcement (external CVE broadcast sets minimum)
+  //   - A/B testing support (multiple feature versions can share same security_version)
+  // Example: 100 → 100 (A/B variant, same security) → 101 (CVE fix)
+  // Corresponds to Uptane's releaseCounter per image
+  uint64 security_version = 51;
 
   // === Plaintext verification (after decryption) ===
 
@@ -161,12 +262,13 @@ message Artifact {
   // === Source discovery ===
 
   // Download sources (try in priority order)
-  // If empty and content_addressable=true, device can auto-discover
+  // Source type determines fetch method:
+  //   - "http"/"https": Fetch from source.uri
+  //   - "ipfs": Use ciphertext_hash as IPFS CID
+  //   - "ca": Lookup in local cache by ciphertext_hash
+  //   - "bittorrent": Use ciphertext_hash as infohash
+  // ciphertext_hash always used for verification after download
   repeated Source sources = 40;
-
-  // If true, artifact can be located by ciphertext_hash
-  // Device may construct URIs like: ipfs://<ciphertext_hash>
-  bool content_addressable = 41;
 }
 
 /**
@@ -214,10 +316,56 @@ message EncryptionParams {
 }
 
 /**
+ * Artifact information (what an update provides)
+ * Duplicates key fields from Artifact for unverified filtering
+ */
+message ArtifactInfo {
+  // Unique identifier
+  string name = 1;
+
+  // Artifact type
+  string type = 2;
+
+  // Target ECU
+  string target_ecu = 3;
+
+  // Security version this update provides
+  uint64 security_version = 4;
+
+  // Feature version (optional, for display)
+  SemVer version = 5;
+}
+
+/**
+ * Artifact constraint (what an update requires from device)
+ * Used by workshop to determine safe upgrade path
+ */
+message ArtifactConstraint {
+  // Artifact identifier
+  string name = 1;
+  string type = 2;
+  string target_ecu = 3;
+
+  // Minimum security version required on device (inclusive)
+  // Device must have artifact with security_version >= this value
+  uint64 min_security_version = 4;
+
+  // Maximum security version supported (inclusive, optional)
+  // If set, device must have artifact with security_version <= this value
+  // Used for limiting upgrade jumps (e.g., database migrations)
+  // If 0, no upper limit
+  uint64 max_security_version = 5;
+}
+
+/**
  * Device metadata (embedded in X.509 certificate extension OID 1.3.6.1.3.1)
  *
  * Identifies the device/certificate purpose and hardware requirements.
  * Used for certificate validation and update routing.
+ *
+ * SECURITY: This extension is cryptographically signed (part of X.509 certificate).
+ * UpdateCertificate::LoadFromPEM() verifies the signature before allowing access.
+ * Used for device identification and prerequisite checking.
  */
 message DeviceMetadata {
   // Device type/role
@@ -234,4 +382,14 @@ message DeviceMetadata {
   // Optional hardware version
   // Examples: "v1.0", "rev-B", "2024"
   string hardware_version = 4;
+
+  // What this update requires from device
+  // Workshop uses this to determine safe upgrade path
+  // Example: Update requires firmware v5-12, device at v10 → safe
+  //          Update requires firmware v15+, device at v10 → must upgrade first
+  repeated ArtifactConstraint requires = 5;
+
+  // REMOVED: manifest_version (now only in Manifest - avoid duplication)
+  // REMOVED: manifest_type (now only in Manifest - avoid duplication)
+  // REMOVED: provides (derive from Manifest.artifacts - avoid duplication)
 }

@@ -104,41 +104,49 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        LOG(INFO) << "Loading certificate chain (PEM bundle) from: " << certificate_file;
-        auto cert_chain = sum::crypto::Certificate::LoadChainFromFile(certificate_file);
-        LOG(INFO) << "Loaded " << cert_chain.size() << " certificate(s) from chain";
+        LOG(INFO) << "Loading root CA certificate from: " << backend_ca_file;
+        auto root_ca = sum::crypto::Certificate::LoadFromFile(backend_ca_file);
 
-        // Extract update certificate (first in chain)
-        const auto& update_certificate = cert_chain[0];
+        LOG(INFO) << "Loading and verifying update certificate (2-cert PEM bundle) from: " << certificate_file;
+        auto update_certificate = sum::crypto::UpdateCertificate::LoadFromFile(
+            certificate_file,
+            root_ca,
+            time(nullptr)
+        );
+        LOG(INFO) << "Update certificate loaded and verified (update cert + intermediate)";
 
-        // Step 1: Quick filtering - extract device metadata (UNVERIFIED)
-        if (update_certificate.HasDeviceMetadata()) {
-            try {
-                auto metadata = update_certificate.GetDeviceMetadata();
+        // Step 1: Extract device metadata (already verified during load)
+        try {
+            auto metadata = update_certificate.GetDeviceMetadata();
 
-                LOG(INFO) << "Device Metadata (UNVERIFIED - for filtering only):";
-                LOG(INFO) << "  Hardware ID: " << metadata.hardware_id;
-                LOG(INFO) << "  Manufacturer: " << metadata.manufacturer;
-                LOG(INFO) << "  Device Type: " << metadata.device_type;
+            LOG(INFO) << "Device Metadata (VERIFIED):";
+            LOG(INFO) << "  Hardware ID: " << metadata.hardware_id;
+            LOG(INFO) << "  Manufacturer: " << metadata.manufacturer;
+            LOG(INFO) << "  Device Type: " << metadata.device_type;
+            if (!metadata.hardware_version.empty()) {
+                LOG(INFO) << "  Hardware Version: " << metadata.hardware_version;
+            }
+
+            if (show_metadata) {
+                std::cout << "\n=== Device Metadata ===\n";
+                std::cout << "  Device Type: " << metadata.device_type << "\n";
+                std::cout << "  Hardware ID: " << metadata.hardware_id << "\n";
+                std::cout << "  Manufacturer: " << metadata.manufacturer << "\n";
                 if (!metadata.hardware_version.empty()) {
-                    LOG(INFO) << "  Hardware Version: " << metadata.hardware_version;
+                    std::cout << "  Hardware Version: " << metadata.hardware_version << "\n";
                 }
+                std::cout << std::endl;
+            }
 
-                if (show_metadata) {
-                    std::cout << "\n=== Device Metadata ===\n";
-                    std::cout << "  Device Type: " << metadata.device_type << "\n";
-                    std::cout << "  Hardware ID: " << metadata.hardware_id << "\n";
-                    std::cout << "  Manufacturer: " << metadata.manufacturer << "\n";
-                    if (!metadata.hardware_version.empty()) {
-                        std::cout << "  Hardware Version: " << metadata.hardware_version << "\n";
-                    }
-                    std::cout << std::endl;
-                }
-
-                // TODO: In real deployment, check if hardware_id matches this device
-                // If not, skip update to save time
-            } catch (const std::exception& e) {
-                LOG(ERROR) << "❌ Fatal error: Failed to parse device metadata: " << e.what();
+            // TODO: In real deployment, check if hardware_id matches this device
+            // If not, skip update to save time
+        } catch (const sum::crypto::CryptoError& e) {
+            // Device metadata extension not present or verification failed
+            std::string err(e.what());
+            if (err.find("Extension not found") != std::string::npos) {
+                LOG(INFO) << "No device metadata extension present (optional)";
+            } else {
+                LOG(ERROR) << "❌ Fatal error: Failed to verify device metadata: " << e.what();
                 return 1;
             }
         }
@@ -150,23 +158,8 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "Loading device private key from: " << device_key_file;
         auto device_key = sum::crypto::PrivateKey::LoadFromFile(device_key_file);
 
-        LOG(INFO) << "Loading root CA certificate from: " << backend_ca_file;
-        auto root_ca = sum::crypto::Certificate::LoadFromFile(backend_ca_file);
-
-        // Build intermediates list from chain (skip first cert, which is the update cert)
-        std::vector<sum::crypto::Certificate> intermediates;
-        for (size_t i = 1; i < cert_chain.size(); ++i) {
-            intermediates.push_back(std::move(cert_chain[i]));
-        }
-
-        LOG(INFO) << "Creating manifest validator with certificate chain:";
-        if (!intermediates.empty()) {
-            LOG(INFO) << "  Update cert → " << intermediates.size() << " intermediate(s) → root CA";
-        } else {
-            LOG(INFO) << "  Update cert → root CA (no intermediates)";
-        }
-
-        sum::ManifestValidator validator(root_ca, intermediates, device_key);
+        LOG(INFO) << "Creating manifest validator";
+        sum::ManifestValidator validator(root_ca, device_key);
 
         // Step 2: Validate certificate chain and extract VERIFIED manifest
         LOG(INFO) << "Validating certificate chain and extracting manifest...";

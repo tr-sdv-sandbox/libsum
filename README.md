@@ -1,24 +1,23 @@
 # libsum - Secure Update Manifest
 
-A modern, security-focused library for cryptographically signed and encrypted software updates using X.509 certificates. Designed for both offline and online OTA deployments.
+Library for cryptographically signed and encrypted software updates using X.509 certificates. Supports both offline and online OTA deployments.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ## Overview
 
-**libsum** provides a secure framework for software updates in embedded systems, IoT devices, and general computing platforms. Updates are distributed as **X.509 certificates** containing embedded manifests and device metadata - making them secure whether delivered via USB stick in a workshop or downloaded over the internet.
+**libsum** provides a framework for software updates in embedded systems, IoT devices, and general computing platforms. Updates are distributed as **X.509 certificates** containing embedded manifests and device metadata, with encrypted firmware as a separate file.
 
 ### Key Features
 
-- **Certificate-Only Distribution** - Single .crt file contains everything needed
-- **Offline-First Security** - USB/SD card delivery as secure as online OTA
-- **Cryptographic Authenticity** - Ed25519 signatures prevent tampering
-- **IP Protection** - X25519 key wrapping + AES encryption prevents software theft
+- **Certificate + Encrypted Firmware Distribution** - .crt certificate + .enc encrypted firmware
+- **Offline Security** - USB/SD card delivery works without network connectivity
+- **Cryptographic Authenticity** - Ed25519 signatures verify update source
+- **Encryption** - X25519 key wrapping + AES-128-GCM encryption
 - **Device-Specific** - Per-device encryption via public key cryptography
 - **Anti-Rollback & Replay Prevention** - Version tracking blocks downgrades and re-installations
 - **Certificate Revocation** - Timestamp-based emergency revocation without CRL/OCSP
-- **Secure-by-Design API** - Impossible to use manifests without verification
-- **Production-Ready** - Comprehensive test suite with 62 passing tests
+- **API Design** - Manifests accessible only after signature verification
 
 ### Security Model
 
@@ -27,7 +26,7 @@ A modern, security-focused library for cryptographically signed and encrypted so
 │ Backend (Build Time)                    │
 │ 1. Hash software (SHA-256)              │
 │ 2. Sign hash (Ed25519)                  │
-│ 3. Encrypt software (AES-128-CTR)       │
+│ 3. Encrypt software (AES-128-GCM)       │
 │ 4. Wrap key with device pubkey (X25519)│
 │ 5. Embed in X.509 certificate           │
 │ 6. Sign certificate with CA key         │
@@ -89,10 +88,10 @@ sudo make install
 ./tools/sum-keygen --public device.key --output device.pub
 ```
 
-**Production PKI Hierarchy (RECOMMENDED):**
-- **Root CA** - Kept offline in HSM, only signs intermediate CAs
-- **Intermediate CA** - Online, signs update certificates
-- **Benefits**: Root CA compromise much less likely, can revoke intermediate
+**PKI Hierarchy Options:**
+- **Root CA** - Signs intermediate CAs
+- **Intermediate CA** - Signs update certificates
+- Separation allows revoking intermediate CA without replacing root on devices
 
 #### 2. Create Update Certificate (Backend)
 
@@ -106,7 +105,12 @@ sudo make install
   --manufacturer "Acme Corp" \
   --device-type "ESP32-Gateway" \
   --hardware-version "v2.1" \
-  --version 42 \
+  --artifact-name firmware \
+  --artifact-type firmware \
+  --target-ecu primary \
+  --sw-version "1.0.0" \
+  --sw-security-version 42 \
+  --manifest-version 1 \
   --output update.crt \
   --encrypted-output firmware.enc
 ```
@@ -130,7 +134,7 @@ sudo make install
   --output firmware.bin
 ```
 
-**Result:** Verified, decrypted `firmware.bin` ready to install!
+Outputs verified, decrypted `firmware.bin`.
 
 ## Architecture
 
@@ -149,22 +153,31 @@ sudo make install
 │  - extendedKeyUsage: codeSigning         │
 ├─────────────────────────────────────────┤
 │  Extension #1 (OID 1.3.6.1.3.1) CRITICAL│
-│  Device Metadata (JSON, unencrypted):   │
+│  Device Metadata (Protobuf):            │
 │  {                                       │
 │    "hardware_id": "DEVICE-12345",       │
 │    "manufacturer": "Acme Corp",         │
 │    "device_type": "ESP32-Gateway",      │
-│    "hardware_version": "v2.1"           │
+│    "hardware_version": "v2.1",          │
+│    "requires": [{                        │
+│      "name": "firmware",                │
+│      "min_security_version": 5          │
+│    }]                                    │
 │  }                                       │
-│  ⚠️  Readable without verification       │
-│     (for quick filtering)                │
+│  ⚠️  Cryptographically signed            │
+│     (verified during certificate load)  │
 ├─────────────────────────────────────────┤
 │  Extension #2 (OID 1.3.6.1.3.2) CRITICAL│
 │  Secure Update Manifest (Protobuf):     │
 │  {                                       │
 │    "manifest_version": 42,              │
+│    "type": "FULL",                      │
 │    "artifacts": [{                       │
 │      "name": "application",             │
+│      "type": "firmware",                │
+│      "target_ecu": "primary",           │
+│      "version": "1.0.0",                │
+│      "security_version": 15,            │
 │      "hash_algorithm": "SHA-256",       │
 │      "expected_hash": "...",            │
 │      "signature": "...",                │
@@ -176,7 +189,7 @@ sudo make install
 │      "wrapped_key": "..." (X25519)      │
 │    }]                                    │
 │  }                                       │
-│  ✅ Requires GetVerifiedManifest()       │
+│  ✅ Verified during certificate load     │
 └─────────────────────────────────────────┘
         ↓ Signed by CA private key
    Cryptographic integrity for ALL fields
@@ -214,6 +227,102 @@ Device validates:
   Update cert → Intermediate cert → Root CA (pre-installed)
 ```
 
+### Workshop Filtering (Device Requirements)
+
+Certificates contain **device requirements** in the DeviceMetadata extension for workshop technicians to determine compatibility:
+
+```
+Device Metadata (VERIFIED - signed with certificate):
+  ├─ hardware_id, manufacturer, device_type    (device identification)
+  └─ requires: [ArtifactConstraint]            (device state requirements)
+
+Manifest (VERIFIED - accessible after certificate verification):
+  ├─ manifest_version                          (for ordering updates)
+  ├─ type (FULL or DELTA)                      (update type)
+  └─ artifacts: [ArtifactInfo]                 (what this update provides)
+```
+
+**Workshop Use Case:**
+```
+Device State: firmware@primary security_version=10
+
+USB Stick has:
+  ├─ update_v5.crt:  artifacts[firmware@primary sv=15], requires sv [5,12]
+  └─ update_v6.crt:  artifacts[firmware@primary sv=20], requires sv ≥15
+
+Technician determines (after verifying certificates):
+  1. Device (sv=10) matches update_v5 requirements (10 in [5,12]) → Apply v5
+  2. After v5, device (sv=15) matches update_v6 requirements (15≥15) → Apply v6
+  3. Cannot skip v5 and jump to v6 (sv=10 < 15)
+```
+
+**⚠️ Security Note:** All metadata is cryptographically signed. Certificates must be verified against root CA before extracting metadata or manifest.
+
+### Content-Addressable Storage
+
+All artifacts include a **ciphertext_hash** (SHA-256 of encrypted file) enabling content-addressable storage without additional flags:
+
+```
+Artifact always contains:
+  ├─ ciphertext_hash (32 bytes SHA-256)
+  ├─ ciphertext_size (for download progress)
+  └─ sources[] (priority-ordered download locations)
+```
+
+**Source Type Determines Fetch Method:**
+
+```cpp
+// Traditional HTTP/HTTPS sources
+builder.AddArtifact("firmware", encrypted)
+    .AddSource("https://cdn.example.com/firmware.enc", 0, "https")
+    .AddSource("https://backup.example.com/firmware.enc", 1, "https");
+
+// Content-addressable sources (IPFS, local cache, P2P)
+builder.AddArtifact("firmware", encrypted)
+    .AddSource("ipfs://QmHash...", 0, "ipfs")           // Use ciphertext_hash as IPFS CID
+    .AddSource("ca://local-cache", 1, "ca")            // Lookup in local cache by hash
+    .AddSource("https://cdn.example.com/fw.enc", 2);   // HTTP fallback
+
+// Client fetches in priority order, verifies with ciphertext_hash
+```
+
+**Device-Side Fetch Logic:**
+
+```cpp
+for (const auto& source : artifact.sources) {
+    std::vector<uint8_t> data;
+
+    if (source.type == "ipfs") {
+        // Fetch from IPFS using ciphertext_hash as CID
+        data = ipfs_client.Get(artifact.ciphertext_hash);
+    } else if (source.type == "ca") {
+        // Lookup in local cache by hash
+        data = cache.Lookup(artifact.ciphertext_hash);
+    } else if (source.type == "bittorrent") {
+        // Use ciphertext_hash as infohash
+        data = torrent_client.Download(artifact.ciphertext_hash);
+    } else {
+        // Default: fetch from source.uri (HTTP/HTTPS)
+        data = http_client.Get(source.uri);
+    }
+
+    // Verify download integrity (ALWAYS)
+    if (SHA256(data) == artifact.ciphertext_hash) {
+        return data;  // Success!
+    }
+}
+```
+
+**Benefits:**
+
+- **Deduplication**: Same firmware = same hash → cache once, reuse everywhere
+- **P2P Distribution**: Devices can fetch from peers (IPFS, BitTorrent, mesh networks)
+- **Offline Caching**: Workshop can cache by hash, apply any compatible update
+- **Source Flexibility**: Add new storage backends without protocol changes
+- **Integrity**: Hash verification detects corrupted/wrong downloads before decryption
+
+**No Boolean Flag Needed**: The presence of a content-addressable source type (ipfs, ca, bittorrent) implies CA support. The protocol provides the hash and verification; client chooses which CA systems to implement.
+
 ## C++ API Examples
 
 ### Backend: Generate Update Certificate
@@ -221,7 +330,7 @@ Device validates:
 ```cpp
 #include "sum/crypto.h"
 #include "sum/manifest.h"
-#include "sum/generator.h"
+#include "sum/manifest_builder.h"
 
 using namespace sum;
 
@@ -233,23 +342,43 @@ auto device_pubkey = crypto::PublicKey::LoadFromFile("device.pub");
 // Read firmware
 auto firmware = ReadBinaryFile("firmware.bin");
 
-// Create device metadata
+// Create device metadata (device identification + requirements)
 DeviceMetadata device_meta;
 device_meta.hardware_id = "DEVICE-12345";      // Links to device pubkey in DB
 device_meta.manufacturer = "Acme Corp";
 device_meta.device_type = "ESP32-Gateway";
 device_meta.hardware_version = "v2.1";
 
+// Device state requirements (optional - for compatibility checking)
+ArtifactConstraint requires_constraint;
+requires_constraint.name = "firmware";
+requires_constraint.type = "firmware";
+requires_constraint.target_ecu = "primary";
+requires_constraint.min_security_version = 0;  // Accept any version (fresh install)
+requires_constraint.max_security_version = 0;  // No upper limit
+device_meta.requires.push_back(requires_constraint);
+
+// Encrypt firmware once
+auto encrypted_artifact = EncryptSoftware(firmware);
+
+// Build manifest with single artifact
+ManifestBuilder builder(ca_key, ca_cert);
+builder.AddArtifact("firmware", encrypted_artifact)
+    .SetType("firmware")
+    .SetTargetECU("primary")
+    .SetVersion(SemVer{1, 0, 0, "", ""})
+    .SetSecurityVersion(42);
+
 // Generate update certificate
-ManifestGenerator generator(ca_key, ca_cert);
-auto [certificate, encrypted_firmware] = generator.CreateCertificate(
-    firmware,
+auto [certificate, encrypted_files] = builder.BuildCertificate(
     device_pubkey,
     device_meta,
-    42,  // version
-    true,  // use encryption
+    1,   // manifest_version
     90   // validity days
 );
+
+// Extract encrypted firmware
+auto encrypted_firmware = encrypted_files.at("firmware");
 
 // Save for distribution
 WriteBinaryFile("update.crt", certificate.ToDER());
@@ -261,49 +390,104 @@ WriteBinaryFile("firmware.enc", encrypted_firmware);
 ```cpp
 #include "sum/crypto.h"
 #include "sum/manifest.h"
-#include "sum/validator.h"
+#include "sum/client/validator.h"
 
 using namespace sum;
 
-// Load certificate and encrypted firmware
-auto certificate = crypto::Certificate::LoadFromFile("update.crt");
+// Load encrypted firmware
 auto encrypted_firmware = ReadBinaryFile("firmware.enc");
 
-// Step 1: Quick filtering (UNVERIFIED - for performance)
-if (certificate.HasDeviceMetadata()) {
-    auto metadata_json = certificate.ExtractDeviceMetadata();
-    auto metadata = nlohmann::json::parse(metadata_json);
+// Step 1: Load root CA and device key
+auto root_ca = crypto::Certificate::LoadFromFile("ca.crt");
+auto device_key = crypto::PrivateKey::LoadFromFile("device.key");
 
-    if (metadata["hardware_id"] != MY_HARDWARE_ID) {
-        return; // Not for this device, skip expensive crypto
+// Step 2: Load and verify update certificate atomically
+// This performs full chain validation: update → intermediate → root
+auto update_cert = crypto::UpdateCertificate::LoadFromFile(
+    "update.crt",                             // PEM bundle (update + intermediate)
+    root_ca,                                  // Root CA for verification
+    time(nullptr),                            // Trusted time (for expiry check)
+    LoadFromFlash("reject_before", 0)         // Certificate revocation timestamp
+);
+// ✅ Certificate is now VERIFIED - all extensions are cryptographically protected
+
+// Step 3: Extract verified device metadata
+auto metadata = update_cert.GetDeviceMetadata();
+if (metadata.hardware_id != MY_HARDWARE_ID) {
+    return; // Not for this device
+}
+
+// Step 4: Check device compatibility (verified metadata)
+if (!metadata.requires.empty()) {
+    auto current_sv = LoadFromFlash("current_security_version", 0);
+    for (const auto& constraint : metadata.requires) {
+        if (constraint.name == "firmware" && constraint.target_ecu == "primary") {
+            if (current_sv < constraint.min_security_version) {
+                LOG("Update requires security_version >= %d, current is %d",
+                    constraint.min_security_version, current_sv);
+                return; // Skip update, doesn't meet requirements
+            }
+        }
     }
 }
 
-// Step 2: Load device key and CA cert
-auto device_key = crypto::PrivateKey::LoadFromFile("device.key");
-auto ca_cert = crypto::Certificate::LoadFromFile("ca.crt");
-
-// Step 3: Set security policies (anti-rollback + revocation)
-ManifestValidator validator(ca_cert, device_key);
+// Step 5: Create validator with security policies
+ManifestValidator validator(root_ca, device_key);
 validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0));
 validator.SetRejectCertificatesBefore(LoadFromFlash("reject_before", 0));
 
-// Step 4: Validate certificate and extract VERIFIED manifest
-auto manifest = validator.ValidateCertificate(certificate, time(nullptr));
+// Step 6: Validate certificate and extract manifest
+auto manifest = validator.ValidateCertificate(update_cert, time(nullptr));
 // ✅ Throws CryptoError if signature invalid, expired, or policy violated
+// ✅ Enforces anti-rollback/replay protection (version <= last rejected)
 
-// Step 5: Decrypt and verify firmware
-auto aes_key = validator.UnwrapEncryptionKey(manifest);
-auto firmware = validator.DecryptSoftware(encrypted_firmware, aes_key, manifest);
+// Step 7: Unwrap encryption key
+size_t artifact_index = 0;  // First artifact
+auto aes_key = validator.UnwrapEncryptionKey(manifest, artifact_index);
 
-if (!validator.VerifySoftware(firmware, manifest)) {
-    throw std::runtime_error("Firmware verification failed");
+// Step 8: Create streaming decryptor and hasher
+auto decryptor = validator.CreateDecryptor(aes_key, manifest, artifact_index);
+crypto::SHA256::Hasher hasher;
+
+// Step 9: Stream decrypt and hash (process in chunks for large files)
+std::ofstream output("firmware.bin", std::ios::binary);
+constexpr size_t CHUNK_SIZE = 4096;
+size_t offset = 0;
+
+while (offset < encrypted_firmware.size()) {
+    size_t chunk_size = std::min(CHUNK_SIZE, encrypted_firmware.size() - offset);
+    std::vector<uint8_t> encrypted_chunk(
+        encrypted_firmware.begin() + offset,
+        encrypted_firmware.begin() + offset + chunk_size
+    );
+
+    auto decrypted_chunk = decryptor->Update(encrypted_chunk);
+    hasher.Update(decrypted_chunk);
+    output.write(reinterpret_cast<const char*>(decrypted_chunk.data()),
+                 decrypted_chunk.size());
+
+    offset += chunk_size;
 }
 
-// Step 6: Install verified firmware
-InstallFirmware(firmware);
+// Finalize decryption
+auto final_chunk = decryptor->Finalize();
+if (!final_chunk.empty()) {
+    hasher.Update(final_chunk);
+    output.write(reinterpret_cast<const char*>(final_chunk.data()),
+                 final_chunk.size());
+}
+output.close();
 
-// Step 7: Persist new version (anti-rollback)
+// Step 10: Verify hash and signature
+auto computed_hash = hasher.Finalize();
+if (!validator.VerifySignature(computed_hash, manifest, artifact_index)) {
+    throw std::runtime_error("Signature verification failed!");
+}
+
+// Step 11: Install verified firmware
+InstallFirmware("firmware.bin");
+
+// Step 12: Persist new version (anti-rollback/replay protection)
 SaveToFlash("last_version", manifest.GetManifestVersion());
 ```
 
@@ -330,37 +514,47 @@ SaveToFlash("last_version", manifest.GetManifestVersion());
 |-----------|-----------|----------------|
 | Signing | Ed25519 | 128-bit |
 | Key Wrapping | X25519 + ChaCha20-Poly1305 | 128-bit |
-| Symmetric Encryption | AES-128-CTR | 128-bit |
+| Symmetric Encryption | AES-128-GCM | 128-bit |
 | Hashing | SHA-256 | 256-bit |
 | Certificates | X.509 v3 | - |
 
-**Modern Curve25519 Cryptography:**
-- **Ed25519**: Ultra-fast signing, deterministic, side-channel resistant
-- **X25519**: Fast ECDH key agreement, used in Signal, WireGuard, TLS 1.3
-- **Why not NIST curves?**: Curve25519 is simpler, faster, and has better security properties
+**Curve25519 Cryptography:**
+- **Ed25519**: Signing and verification
+- **X25519**: ECDH key agreement
 
 ### Secure-by-Design API
 
-**Impossible to use unverified data:**
+**Atomic Verification - Impossible to bypass:**
 
 ```cpp
-// ❌ Does not exist - cannot load standalone manifests
-Manifest::LoadFromFile("manifest.pb");
+// ❌ Does not exist - cannot load certificate without verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt");
 
-// ✅ ONLY way - must verify certificate
-auto manifest_data = cert.GetVerifiedManifest(ca_cert, time(nullptr));
-auto manifest = Manifest::LoadFromProtobuf(manifest_data);
+// ✅ ONLY way - verification is atomic with load
+auto cert = UpdateCertificate::LoadFromFile(
+    "update.crt",
+    root_ca,          // Must provide root CA
+    time(nullptr),    // Must provide trusted time
+    reject_before     // Optional: certificate revocation
+);
+// ✅ Certificate is VERIFIED - all extensions are now trusted
 ```
 
-**Clear separation of unverified vs verified:**
+**All data is verified:**
 
 ```cpp
-// UNVERIFIED (for quick filtering)
-auto metadata = cert.ExtractDeviceMetadata();
+// Load with atomic verification
+auto cert = UpdateCertificate::LoadFromFile("update.crt", root_ca, time(nullptr));
 
-// VERIFIED (cryptographically protected)
-auto manifest = validator.ValidateCertificate(cert);
-auto verified_metadata = cert.GetVerifiedDeviceMetadata(ca_cert);
+// Extract verified data (no parameters needed - verification already done)
+auto metadata = cert.GetDeviceMetadata();  // ✅ Cryptographically verified
+auto manifest = cert.GetManifest();        // ✅ Cryptographically verified
+
+// Access verified fields
+LOG("Hardware ID: %s", metadata.hardware_id.c_str());
+LOG("Manifest version: %lu", manifest.GetManifestVersion());
+LOG("Manifest type: %s", manifest.GetType() == ManifestType::FULL ? "FULL" : "DELTA");
+LOG("Artifacts: %zu", manifest.GetArtifacts().size());
 ```
 
 ## Command-Line Tools
@@ -393,7 +587,13 @@ Create update certificates:
   --hardware-id DEVICE-12345 \
   --manufacturer "Acme Corp" \
   --device-type "ESP32-Gateway" \
-  --version 42 \
+  --hardware-version "v2.1" \
+  --artifact-name firmware \
+  --artifact-type firmware \
+  --target-ecu primary \
+  --sw-version "1.0.0" \
+  --sw-security-version 42 \
+  --manifest-version 1 \
   --output update.crt \
   --encrypted-output firmware.enc
 ```
@@ -415,7 +615,7 @@ Verify and decrypt updates:
 ## Testing
 
 ```bash
-# Run all tests (62 tests)
+# Run all tests
 ctest --output-on-failure
 
 # Run specific test suite
@@ -425,128 +625,74 @@ ctest -R IntegrationTest
 ctest -R ToolsIntegrationTest -V
 ```
 
-**Test Coverage:**
-- Unit tests: Crypto primitives, manifest parsing
-- Integration tests: End-to-end workflows, tampering detection, anti-rollback, revocation
-- Tools tests: Complete certificate generation and verification
-- Security tests: CA hierarchy, timestamp validation, corrupt data, replay attacks
-
-## Examples
-
-See `examples/` directory for:
-- `backend_example.cpp` - Creating update certificates
-- `device_example.cpp` - Verifying and installing updates
-- `keygen_example.cpp` - Key management
+Test suites cover crypto primitives, manifest parsing, end-to-end workflows, tampering detection, anti-rollback, revocation, CA hierarchy, timestamp validation, and corrupt data handling.
 
 ## Documentation
 
-- **[Security Model](docs/SECURITY.md)** - Threat model, trust hierarchy, incident response
-- **API Documentation** - Build with `make docs` (requires Doxygen)
+API documentation available via Doxygen: `make docs`
 
-## Production Deployment
+## Security Notes
 
-### Backend Recommendations
+### Backend
 
-1. **PKI Hierarchy (CRITICAL)**
-   - **Root CA**: Kept OFFLINE in air-gapped HSM
-   - **Intermediate CA**: Online, signs update certificates
-   - Root CA only signs intermediate CAs (rare operation)
-   - Compromised intermediate can be revoked without re-deploying devices
+**PKI Hierarchy:**
+- Root CA signs intermediate CAs
+- Intermediate CA signs update certificates
+- Allows revoking intermediate without replacing root on devices
 
-2. **Protect Root CA Private Key**
-   - Store in Hardware Security Module (HSM) - offline
-   - Air-gapped system, no network access
-   - Physical security (vault, access logs)
-   - Multi-person authentication required
+**Key Storage:**
+- Root CA: Hardware Security Module (HSM), offline
+- Intermediate CA: HSM with access controls
 
-3. **Protect Intermediate CA Private Key**
-   - Store in online HSM (YubiHSM, AWS CloudHSM, etc.)
-   - Implement strict access controls
-   - Enable comprehensive audit logging
-   - Rotate intermediate CA periodically (e.g., annually)
+**Certificate Validity:**
+- Root CA: 10 years
+- Intermediate CA: 1-3 years
+- Update certificates: 30-90 days
 
-4. **Device Database**
-   - Map `hardware_id → device_public_key`
-   - Validate uniqueness during enrollment
+**OID Registration:**
+- Current OIDs are experimental (1.3.6.1.3.x)
+- Replace with registered PEN from https://www.iana.org/assignments/enterprise-numbers/
 
-5. **Certificate Validity**
-   - Root CA: Long-lived (10 years)
-   - Intermediate CA: Medium-lived (1-3 years)
-   - Update certificates: Short-lived (30-90 days)
-   - Automated renewal process
+### Device
 
-6. **OID Registration**
-   - Current OIDs are experimental (1.3.6.1.3.x)
-   - Register PEN at https://www.iana.org/assignments/enterprise-numbers/
+**Key Storage:**
+- Secure element (ATECC608, TPM 2.0) or encrypted flash
 
-### Device Recommendations
+**Time Source:**
+- Hardware RTC or secure NTP for certificate expiration validation
 
-1. **Secure Key Storage**
-   - Use secure element (ATECC608, TPM 2.0)
-   - Or encrypted flash with hardware keys
-   - Never extract private key
+**Rollback Protection:**
+```cpp
+validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0));
+SaveToFlash("last_version", manifest.GetManifestVersion());  // after install
+```
 
-2. **Trusted Time**
-   - Hardware RTC with battery backup
-   - Or secure NTP
-   - Always validate certificate expiration
+**Revocation:**
+```cpp
+validator.SetRejectCertificatesBefore(LoadFromFlash("reject_before", 0));
+```
 
-3. **Rollback & Replay Protection**
-   - Load persisted version on boot: `validator.SetLastInstalledVersion(LoadFromFlash("last_version", 0))`
-   - After successful install: `SaveToFlash("last_version", manifest.GetManifestVersion())`
-   - Automatically rejects `manifest_version ≤ current_version`
-
-4. **Certificate Revocation (Emergency)**
-   - Load revocation timestamp on boot: `validator.SetRejectCertificatesBefore(LoadFromFlash("reject_before", 0))`
-   - When emergency update received: `SaveToFlash("reject_before", emergency_timestamp)`
-   - Automatically rejects intermediate CAs issued before timestamp
-
-5. **Atomic Updates**
-   - Double-buffering or A/B partitions
-   - Verify before committing
+**Atomic Updates:**
+- Double-buffering or A/B partitions
 
 ## Platform Support
 
-- **Tested on:** Linux (Ubuntu 22.04+)
-- **Embedded Targets:** ESP32, STM32, Linux-based IoT devices
-- **Compilers:** GCC 9+, Clang 10+
-- **C++ Standard:** C++17 or later
+- Linux (Ubuntu 22.04+)
+- ESP32, STM32, Linux-based IoT devices
+- GCC 9+, Clang 10+
+- C++17
 
 ## Dependencies
 
-- OpenSSL 1.1.1+ (crypto library)
-- nlohmann/json (JSON parsing)
+- OpenSSL 1.1.1+
+- nlohmann/json
 - Google Logging (glog)
 - Google Test (testing only)
 
 ## License
 
-Apache License 2.0 - See [LICENSE](LICENSE) for details.
+Apache License 2.0
 
-## Contributing
+## Security Vulnerabilities
 
-Contributions welcome! Please:
-1. Run tests: `ctest --output-on-failure`
-2. Follow existing code style
-3. Add tests for new features
-4. Update documentation
-
-## Security
-
-For security vulnerabilities, please contact the maintainers privately.
-
-**Do NOT open public GitHub issues for security vulnerabilities.**
-
-For general security questions, see [docs/SECURITY.md](docs/SECURITY.md).
-
-## Acknowledgments
-
-Built with:
-- OpenSSL - Cryptographic primitives
-- nlohmann/json - JSON parsing
-- Google Test - Testing framework
-- Google Logging - Logging
-
----
-
-**libsum** - Secure software updates, offline or online.
+Contact maintainers privately. Do not open public GitHub issues.

@@ -4,7 +4,6 @@ cmake_minimum_required(VERSION 3.16)
 
 # Backend library (static)
 add_library(sum-backend STATIC
-    src/generator.cpp
     src/manifest_builder.cpp
 )
 
@@ -89,6 +88,7 @@ endif()
 if(BUILD_TESTS)
     add_executable(sum-backend-tests
         tests/manifest_builder_test.cpp
+        tests/update_certificate_test.cpp
     )
 
     target_link_libraries(sum-backend-tests PRIVATE

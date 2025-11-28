@@ -67,6 +67,15 @@ void ToProto(const SoftwareArtifact& artifact, ::sum::proto::Artifact* proto) {
     proto->set_target_ecu(artifact.target_ecu);
     proto->set_install_order(artifact.install_order);
 
+    // Versioning
+    auto* proto_ver = proto->mutable_version();
+    proto_ver->set_major(artifact.version.major);
+    proto_ver->set_minor(artifact.version.minor);
+    proto_ver->set_patch(artifact.version.patch);
+    proto_ver->set_prerelease(artifact.version.prerelease);
+    proto_ver->set_build_metadata(artifact.version.build_metadata);
+    proto->set_security_version(artifact.security_version);
+
     proto->set_hash_algorithm(artifact.hash_algorithm);
     proto->set_expected_hash(artifact.expected_hash.data(), artifact.expected_hash.size());
     proto->set_size(artifact.size);
@@ -80,7 +89,6 @@ void ToProto(const SoftwareArtifact& artifact, ::sum::proto::Artifact* proto) {
     for (const auto& source : artifact.sources) {
         ToProto(source, proto->add_sources());
     }
-    proto->set_content_addressable(artifact.content_addressable);
 }
 
 // Convert protobuf message to public SoftwareArtifact struct
@@ -90,6 +98,17 @@ SoftwareArtifact FromProto(const ::sum::proto::Artifact& proto) {
     artifact.type = proto.type();
     artifact.target_ecu = proto.target_ecu();
     artifact.install_order = proto.install_order();
+
+    // Versioning
+    if (proto.has_version()) {
+        const auto& proto_ver = proto.version();
+        artifact.version.major = proto_ver.major();
+        artifact.version.minor = proto_ver.minor();
+        artifact.version.patch = proto_ver.patch();
+        artifact.version.prerelease = proto_ver.prerelease();
+        artifact.version.build_metadata = proto_ver.build_metadata();
+    }
+    artifact.security_version = proto.security_version();
 
     artifact.hash_algorithm = proto.hash_algorithm();
     artifact.expected_hash.assign(proto.expected_hash().begin(), proto.expected_hash().end());
@@ -104,7 +123,6 @@ SoftwareArtifact FromProto(const ::sum::proto::Artifact& proto) {
     for (const auto& src_proto : proto.sources()) {
         artifact.sources.push_back(FromProto(src_proto));
     }
-    artifact.content_addressable = proto.content_addressable();
 
     return artifact;
 }
@@ -155,7 +173,6 @@ public:
     mutable bool encryption_cache_valid_ = false;
 
     // Cached copies of byte fields (protobuf uses std::string for bytes)
-    mutable std::vector<uint8_t> manifest_hash_cache_;
     mutable std::vector<uint8_t> signature_cache_;
     mutable std::vector<uint8_t> signing_cert_cache_;
 
@@ -254,32 +271,8 @@ uint64_t Manifest::GetManifestVersion() const {
     return impl_->proto_.manifest_version();
 }
 
-std::optional<SemVer> Manifest::GetSoftwareVersion() const {
-    if (!impl_->proto_.has_software_version()) {
-        return std::nullopt;
-    }
-
-    const auto& proto_ver = impl_->proto_.software_version();
-    SemVer version;
-    version.major = proto_ver.major();
-    version.minor = proto_ver.minor();
-    version.patch = proto_ver.patch();
-    version.prerelease = proto_ver.prerelease();
-    version.build_metadata = proto_ver.build_metadata();
-    return version;
-}
-
-uint64_t Manifest::GetReleaseCounter() const {
-    return impl_->proto_.release_counter();
-}
-
-const std::vector<uint8_t>& Manifest::GetManifestHash() const {
-    const std::string& hash_str = impl_->proto_.manifest_hash();
-    impl_->manifest_hash_cache_.assign(
-        reinterpret_cast<const uint8_t*>(hash_str.data()),
-        reinterpret_cast<const uint8_t*>(hash_str.data()) + hash_str.size()
-    );
-    return impl_->manifest_hash_cache_;
+ManifestType Manifest::GetType() const {
+    return static_cast<ManifestType>(impl_->proto_.type());
 }
 
 const std::vector<SoftwareArtifact>& Manifest::GetArtifacts() const {
@@ -356,23 +349,6 @@ void Manifest::SetManifestVersion(uint64_t version) {
     impl_->proto_.set_manifest_version(version);
 }
 
-void Manifest::SetSoftwareVersion(const SemVer& version) {
-    auto* proto_ver = impl_->proto_.mutable_software_version();
-    proto_ver->set_major(version.major);
-    proto_ver->set_minor(version.minor);
-    proto_ver->set_patch(version.patch);
-    proto_ver->set_prerelease(version.prerelease);
-    proto_ver->set_build_metadata(version.build_metadata);
-}
-
-void Manifest::SetReleaseCounter(uint64_t counter) {
-    impl_->proto_.set_release_counter(counter);
-}
-
-void Manifest::SetManifestHash(const std::vector<uint8_t>& hash) {
-    impl_->proto_.set_manifest_hash(hash.data(), hash.size());
-}
-
 void Manifest::AddArtifact(SoftwareArtifact artifact) {
     ToProto(artifact, impl_->proto_.add_artifacts());
     impl_->InvalidateCaches();
@@ -410,6 +386,18 @@ DeviceMetadata DeviceMetadata::FromProtobuf(const std::vector<uint8_t>& data) {
     metadata.manufacturer = proto.manufacturer();
     metadata.device_type = proto.device_type();
     metadata.hardware_version = proto.hardware_version();
+
+    // Requires
+    for (const auto& proto_constraint : proto.requires()) {
+        ArtifactConstraint constraint;
+        constraint.name = proto_constraint.name();
+        constraint.type = proto_constraint.type();
+        constraint.target_ecu = proto_constraint.target_ecu();
+        constraint.min_security_version = proto_constraint.min_security_version();
+        constraint.max_security_version = proto_constraint.max_security_version();
+        metadata.requires.push_back(constraint);
+    }
+
     return metadata;
 }
 
@@ -420,6 +408,16 @@ std::vector<uint8_t> DeviceMetadata::ToProtobuf() const {
     proto.set_device_type(device_type);
     if (!hardware_version.empty()) {
         proto.set_hardware_version(hardware_version);
+    }
+
+    // Requires
+    for (const auto& constraint : requires) {
+        auto* proto_constraint = proto.add_requires();
+        proto_constraint->set_name(constraint.name);
+        proto_constraint->set_type(constraint.type);
+        proto_constraint->set_target_ecu(constraint.target_ecu);
+        proto_constraint->set_min_security_version(constraint.min_security_version);
+        proto_constraint->set_max_security_version(constraint.max_security_version);
     }
 
     std::vector<uint8_t> data(proto.ByteSizeLong());

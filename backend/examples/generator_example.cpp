@@ -11,7 +11,7 @@
 
 #include "sum/common/crypto.h"
 #include "sum/common/manifest.h"
-#include "sum/backend/generator.h"
+#include "sum/backend/manifest_builder.h"
 #include <glog/logging.h>
 #include <fstream>
 #include <iostream>
@@ -96,16 +96,27 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "  Creating PEM bundle: update cert + intermediate cert";
         LOG(INFO) << "  Signing with intermediate CA (not root CA)";
 
-        ManifestGenerator generator(intermediate_key, intermediate_cert);
+        // Encrypt firmware once
+        auto encrypted_artifact = EncryptSoftware(firmware);
 
-        auto [pem_chain, encrypted_firmware] = generator.CreateCertificateChainPEM(
-            firmware,           // Software to distribute
+        // Build manifest with single artifact
+        constexpr const char* ARTIFACT_NAME = "firmware";
+        ManifestBuilder builder(intermediate_key, intermediate_cert);
+        builder.AddArtifact(ARTIFACT_NAME, encrypted_artifact)
+            .SetType("firmware")
+            .SetTargetECU("primary")
+            .SetVersion(SemVer{0, 0, 42, "", ""});  // Version 0.0.42 for anti-rollback
+
+        // Generate certificate chain (PEM bundle)
+        auto [pem_chain, encrypted_files] = builder.BuildCertificateChainPEM(
             device_pubkey,      // Device's public key (for encryption)
             device_meta,        // Device metadata (for filtering)
-            42,                 // Version number (for anti-rollback)
-            true,               // Use encryption (recommended)
+            42,                 // Manifest version (for anti-rollback)
             90                  // Certificate validity (days)
         );
+
+        // Extract encrypted firmware
+        auto encrypted_firmware = encrypted_files.at(ARTIFACT_NAME);
 
         LOG(INFO) << "  ✅ Certificate chain generated (PEM bundle)";
         LOG(INFO) << "  PEM chain size: " << pem_chain.size() << " bytes";

@@ -160,9 +160,9 @@ void PrintUsageBuild(const char* program_name) {
               << "  --backend-cert FILE       Backend certificate (intermediate CA)\n"
               << "  --output FILE             Output certificate file (.crt)\n"
               << "\n"
-              << "Version Options (at least one required):\n"
-              << "  --sw-version VERSION      Semantic version (e.g., \"1.2.3\" or \"1.2.3-beta.1+git.abc\")\n"
-              << "  --version VERSION         Simple version number (DEPRECATED, use --sw-version)\n"
+              << "Version Options:\n"
+              << "  --manifest-version NUM    Manifest version (monotonic counter, per-manifest) [required]\n"
+              << "                            Used for replay protection (must increase per manifest)\n"
               << "\n"
               << "Optional:\n"
               << "  --hardware-version VER    Hardware version\n"
@@ -186,7 +186,7 @@ void PrintUsageBuild(const char* program_name) {
               << "    --device-type \"ESP32-Gateway\" \\\n"
               << "    --backend-key intermediate.key \\\n"
               << "    --backend-cert intermediate.crt \\\n"
-              << "    --version 1 \\\n"
+              << "    --manifest-version 1 \\\n"
               << "    --output update.crt\n"
               << std::endl;
 }
@@ -308,8 +308,7 @@ int CommandBuild(int argc, char* argv[]) {
     std::string hardware_version;
     std::string backend_key_file;
     std::string backend_cert_file;
-    uint64_t version = 0;
-    std::string sw_version_str;  // Semantic version string
+    uint64_t manifest_version = 0;
     std::string output_file;
     int validity_days = 90;
 
@@ -379,10 +378,8 @@ int CommandBuild(int argc, char* argv[]) {
             backend_key_file = argv[++i];
         } else if (strcmp(argv[i], "--backend-cert") == 0 && i + 1 < argc) {
             backend_cert_file = argv[++i];
-        } else if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
-            version = std::stoull(argv[++i]);
-        } else if (strcmp(argv[i], "--sw-version") == 0 && i + 1 < argc) {
-            sw_version_str = argv[++i];
+        } else if (strcmp(argv[i], "--manifest-version") == 0 && i + 1 < argc) {
+            manifest_version = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--validity-days") == 0 && i + 1 < argc) {
@@ -437,45 +434,24 @@ int CommandBuild(int argc, char* argv[]) {
 
         LOG(INFO) << "Building certificate chain...";
 
-        std::string pem_bundle;
-        std::map<std::string, std::vector<uint8_t>> encrypted_files;
-
-        if (!sw_version_str.empty()) {
-            // Use semantic version (preferred)
-            auto sw_version = ParseSemVer(sw_version_str);
-            auto result = builder.BuildCertificateChainPEM(
-                device_pubkey, device_metadata, sw_version, validity_days
-            );
-            pem_bundle = std::move(result.first);
-            encrypted_files = std::move(result.second);
-
-            LOG(INFO) << "Writing certificate: " << output_file;
-            std::ofstream cert_out(output_file);
-            cert_out << pem_bundle;
-
-            LOG(INFO) << "✅ Manifest generation complete";
-            LOG(INFO) << "   Certificate: " << output_file;
-            LOG(INFO) << "   Artifacts: " << artifacts.size();
-            LOG(INFO) << "   Device: " << hardware_id;
-            LOG(INFO) << "   Version: " << sw_version.ToString();
-        } else {
-            // Use old version number (deprecated path)
-            auto result = builder.BuildCertificateChainPEM(
-                device_pubkey, device_metadata, version, validity_days
-            );
-            pem_bundle = std::move(result.first);
-            encrypted_files = std::move(result.second);
-
-            LOG(INFO) << "Writing certificate: " << output_file;
-            std::ofstream cert_out(output_file);
-            cert_out << pem_bundle;
-
-            LOG(INFO) << "✅ Manifest generation complete";
-            LOG(INFO) << "   Certificate: " << output_file;
-            LOG(INFO) << "   Artifacts: " << artifacts.size();
-            LOG(INFO) << "   Device: " << hardware_id;
-            LOG(INFO) << "   Version: " << version << " (DEPRECATED: use --sw-version)";
+        // Validate manifest version
+        if (manifest_version == 0) {
+            LOG(ERROR) << "Missing required argument: --manifest-version (must be > 0)";
+            return 1;
         }
+        auto [pem_bundle, encrypted_files] = builder.BuildCertificateChainPEM(
+            device_pubkey, device_metadata, manifest_version, validity_days
+        );
+
+        LOG(INFO) << "Writing certificate: " << output_file;
+        std::ofstream cert_out(output_file);
+        cert_out << pem_bundle;
+
+        LOG(INFO) << "✅ Manifest generation complete";
+        LOG(INFO) << "   Certificate: " << output_file;
+        LOG(INFO) << "   Artifacts: " << artifacts.size();
+        LOG(INFO) << "   Device: " << hardware_id;
+        LOG(INFO) << "   Manifest Version: " << manifest_version;
 
         return 0;
     } catch (const std::exception& e) {

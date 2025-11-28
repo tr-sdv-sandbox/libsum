@@ -2,3 +2,8 @@ Testing
 build
 .claude
 
+# Generated protobuf files (auto-generated during build)
+*.pb.cc
+*.pb.h
+
+.idea
